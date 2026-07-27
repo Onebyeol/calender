@@ -1,0 +1,1203 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>신박한 캘린더</title>
+
+<!-- iOS: 홈 화면에 추가했을 때 브라우저 주소창 없이 풀스크린 앱처럼 열리게 함 -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="신박한 캘린더" />
+<meta name="theme-color" content="#3B4177" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+
+<!-- Android: 홈 화면에 추가(PWA) 지원 -->
+<link rel="manifest" href="manifest.json" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=Jua&display=swap" rel="stylesheet" />
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    font-family: 'Jua', -apple-system, sans-serif;
+    background: #EDEDF2;
+  }
+  #page-wrap {
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+  }
+  #app-shell {
+    width: 100%;
+    max-width: 430px;
+    height: 100vh;
+    height: 100dvh;
+    max-height: 926px;
+    min-height: 600px;
+    display: flex;
+    flex-direction: column;
+    position: relative;
+    overflow: hidden;
+    box-shadow: 0 0 40px rgba(0,0,0,0.15);
+  }
+  input, textarea, select { font-family: 'Jua', sans-serif; outline: none; }
+  ::-webkit-scrollbar { width: 0; height: 0; }
+</style>
+</head>
+<body>
+<div id="page-wrap">
+  <div id="app-shell"></div>
+</div>
+
+<script>
+const API_BASE = '/api';
+
+const PRIORITY_META = {
+  high: { label: '높음', color: '#EF6F5B' },
+  medium: { label: '보통', color: '#E8A23D' },
+  low: { label: '낮음', color: '#6FA287' },
+};
+const WEEKDAY_NAMES = ['일','월','화','수','목','금','토'];
+const SAMPLE_NOTICE = '[학사공지] 2026학년도 2학기 수강신청 정정기간 안내\n\n기간: 2026.07.29.(수) 09:00 ~ 18:00\n대상: 전체 재학생\n방법: 학사정보시스템 로그인 후 신청\n문의: 학사지원팀 (02-123-4567)';
+
+function todayIso() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+}
+
+// ============================================================
+// App: 상태 저장 + 렌더링을 담당하는 싱글턴 객체
+// (React 없이, 상태가 바뀔 때마다 앱 전체를 다시 그리는 단순한 구조)
+// ============================================================
+const App = {
+  state: {
+    tab: 'calendar', // 'notify' | 'notice' | 'calendar' | 'todo'
+    dark: false,
+    viewYear: Number(todayIso().slice(0,4)),
+    viewMonth: Number(todayIso().slice(5,7)) - 1,
+    selectedDate: todayIso(),
+    todoDate: todayIso(),
+    events: [],
+    todos: [],
+    loading: true,
+
+    modalOpen: false,
+    modalMode: 'add',
+    form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', alarm: true, notify: true, priority: 'medium' },
+    detailEventId: null,
+    showDetailSource: false,
+
+    yearMonthModalOpen: false,
+    draftYear: null,
+    draftMonth: null,
+
+    todoModalOpen: false,
+    todoDraftTitle: '',
+
+    authScreen: null, // null | 'auth' | 'profile'
+    authMode: 'login',
+    authName: '', authEmail: '', authPassword: '',
+    authFindEmail: '', authFindMessage: '',
+    isLoggedIn: false,
+
+    noticeText: '',
+    imageFile: null,
+    imagePreviewUrl: null,
+    analyzing: false,
+    analyzeError: null,
+    parsedResult: null, // { sourceType, rawContent, result: {summary,priority,category,event,todo} }
+    addedEvent: false,
+    addedTodo: false,
+
+    showOnboarding: false,
+    onboardingStep: 0,
+
+    toastMessage: null,
+    pushEnabled: false,
+  },
+
+  setState(patch) {
+    this.state = { ...this.state, ...(typeof patch === 'function' ? patch(this.state) : patch) };
+    this.render();
+  },
+
+  async init() {
+    // 아이폰 "단축어"에서 공유 시트로 텍스트를 보내면
+    // ?tab=notice&text=... 형태로 열리도록 되어있음 → 공지 탭에 자동으로 채워줌
+    const params = new URLSearchParams(location.search);
+    const sharedText = params.get('text');
+    if (sharedText) {
+      this.state.tab = 'notice';
+      this.state.noticeText = sharedText;
+      history.replaceState(null, '', location.pathname); // 주소창에서 파라미터 지움
+    }
+
+    // 최초 1회만 사용 안내 가이드 표시
+    if (!localStorage.getItem('sc_onboarding_done')) {
+      this.state.showOnboarding = true;
+    }
+
+    this.requestNotifyPermission();
+    this.checkPushEnabled();
+
+    await this.reloadAll();
+    this.state.loading = false;
+    this.render();
+  },
+
+  async reloadAll() {
+    try {
+      const [events, todos] = await Promise.all([
+        fetch(`${API_BASE}/schedule`).then(r => r.json()),
+        fetch(`${API_BASE}/todos`).then(r => r.json()),
+      ]);
+      this.state.events = events;
+      this.state.todos = todos;
+    } catch (err) {
+      console.error('데이터 로딩 실패', err);
+    }
+  },
+};
+
+// ---------- 유틸 ----------
+App.theme = function(dark) {
+  return dark ? {
+    bg: '#12131C', surface: '#1C1E2B', surfaceAlt: '#232538', text: '#EDEDF3',
+    textMuted: '#9A9CB0', textFaint: '#6C6E82', border: '#2C2E3E', primary: '#6B74C9',
+  } : {
+    bg: '#F7F7FA', surface: '#FFFFFF', surfaceAlt: '#F0F0F6', text: '#1B1D2A',
+    textMuted: '#6B6E85', textFaint: '#9C9EB2', border: '#E7E7EE', primary: '#3B4177',
+  };
+};
+App.addDays = function(iso, n) { const d = new Date(iso + 'T00:00:00'); d.setDate(d.getDate() + n); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`; };
+App.formatTime = function(hhmm) {
+  if (!hhmm) return '';
+  const [h, m] = hhmm.split(':').map(Number);
+  const period = h < 12 ? '오전' : '오후';
+  let hh = h % 12; if (hh === 0) hh = 12;
+  return `${period} ${hh}:${String(m).padStart(2,'0')}`;
+};
+App.formatDue = function(iso) {
+  const d = new Date(iso + 'T00:00:00');
+  return `${d.getMonth()+1}/${d.getDate()} (${WEEKDAY_NAMES[d.getDay()]})`;
+};
+App.formatDayHeader = function(iso) {
+  const d = new Date(iso + 'T00:00:00');
+  return `${d.getMonth()+1}월 ${d.getDate()}일 (${WEEKDAY_NAMES[d.getDay()]})`;
+};
+App.esc = function(str) {
+  return String(str ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
+};
+App.styleStr = function(obj) {
+  // 'flex', 'zIndex' 처럼 단위가 없어야 하는 속성 목록 (이것 말고는 숫자면 전부 px를 붙여야 함)
+  const UNITLESS = new Set(['flex', 'flexGrow', 'flexShrink', 'zIndex', 'opacity', 'fontWeight', 'order', 'lineHeight']);
+  return Object.entries(obj).map(([k, v]) => {
+    const kebab = k.replace(/[A-Z]/g, (m) => '-' + m.toLowerCase());
+    const val = (typeof v === 'number' && !UNITLESS.has(k)) ? `${v}px` : v;
+    return `${kebab}:${val}`;
+  }).join(';');
+};
+
+// ---------- 캘린더 월 그리드 (겹치는 멀티데이 일정을 레인에 배치) ----------
+App.buildGrid = function(dark) {
+  const { viewYear, viewMonth, selectedDate, events } = this.state;
+  const first = new Date(viewYear, viewMonth, 1);
+  const startWeekday = first.getDay();
+  const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+  const totalCells = Math.ceil((startWeekday + daysInMonth) / 7) * 7;
+  const tIso = todayIso();
+  const flatDays = [];
+  for (let i = 0; i < totalCells; i++) {
+    const dayNum = i - startWeekday + 1;
+    let cellDate;
+    if (dayNum < 1) cellDate = new Date(viewYear, viewMonth - 1, new Date(viewYear, viewMonth, 0).getDate() + dayNum);
+    else if (dayNum > daysInMonth) cellDate = new Date(viewYear, viewMonth + 1, dayNum - daysInMonth);
+    else cellDate = new Date(viewYear, viewMonth, dayNum);
+    const inMonth = dayNum >= 1 && dayNum <= daysInMonth;
+    const iso = `${cellDate.getFullYear()}-${String(cellDate.getMonth()+1).padStart(2,'0')}-${String(cellDate.getDate()).padStart(2,'0')}`;
+    flatDays.push({ iso, day: cellDate.getDate(), inMonth, isToday: iso === tIso, isSelected: iso === selectedDate });
+  }
+  const weeks = [];
+  for (let i = 0; i < flatDays.length; i += 7) weeks.push(flatDays.slice(i, i + 7));
+
+  const maxLanes = 3;
+  return weeks.map((week) => {
+    const weekStart = week[0].iso, weekEnd = week[6].iso;
+    const overlapping = events.filter(ev => ev.startDate <= weekEnd && ev.endDate >= weekStart)
+      .slice().sort((a, b) => a.startDate === b.startDate ? b.endDate.localeCompare(a.endDate) : a.startDate.localeCompare(b.startDate));
+    const laneEnds = [];
+    const bars = [];
+    let hiddenCount = 0;
+    overlapping.forEach(ev => {
+      const segStart = ev.startDate > weekStart ? ev.startDate : weekStart;
+      const segEnd = ev.endDate < weekEnd ? ev.endDate : weekEnd;
+      const colStart = week.findIndex(d => d.iso === segStart);
+      const colEndIdx = week.findIndex(d => d.iso === segEnd);
+      const colSpan = colEndIdx - colStart + 1;
+      let lane = laneEnds.findIndex(end => end < colStart);
+      if (lane === -1) lane = laneEnds.length;
+      if (lane >= maxLanes) { hiddenCount++; return; }
+      laneEnds[lane] = colStart + colSpan - 1;
+      const isCapLeft = segStart === ev.startDate, isCapRight = segEnd === ev.endDate;
+      bars.push({
+        id: ev._id, title: ev.title, lane,
+        left: (colStart / 7) * 100, width: (colSpan / 7) * 100,
+        color: (PRIORITY_META[ev.priority] || PRIORITY_META.medium).color,
+        isCapLeft, isCapRight,
+      });
+    });
+    const laneCount = Math.min(maxLanes, laneEnds.length);
+    return { days: week, bars, laneCount, hiddenCount };
+  });
+};
+
+// ---------- 렌더 ----------
+App.render = function() {
+  const s = this.state;
+  const t = this.theme(s.dark);
+  document.getElementById('page-wrap').style.background = s.dark ? '#0a0a10' : '#EDEDF2';
+  const html = `
+    <div style="${this.styleStr({ height:'100%', display:'flex', flexDirection:'column', position:'relative', background:t.bg, color:t.text, fontFamily:"'Jua',sans-serif" })}">
+      ${this.renderTopBar(t)}
+      ${s.tab === 'calendar' ? this.renderCalendar(t) : ''}
+      ${s.tab === 'notify' ? this.renderNotify(t) : ''}
+      ${s.tab === 'notice' ? this.renderNotice(t) : ''}
+      ${s.tab === 'todo' ? this.renderTodo(t) : ''}
+      ${s.tab === 'help' ? this.renderHelp(t) : ''}
+      ${s.tab === 'calendar' ? this.renderFab(t) : ''}
+      ${this.renderTabBar(t)}
+      ${s.modalOpen ? this.renderEventModal(t) : ''}
+      ${s.todoModalOpen ? this.renderTodoModal(t) : ''}
+      ${s.detailEventId != null ? this.renderDetailModal(t) : ''}
+      ${s.yearMonthModalOpen ? this.renderYearMonthModal(t) : ''}
+      ${s.authScreen === 'auth' ? this.renderAuth(t) : ''}
+      ${s.authScreen === 'profile' ? this.renderProfile(t) : ''}
+      ${s.showOnboarding ? this.renderOnboarding(t) : ''}
+      ${s.toastMessage ? this.renderToast(t) : ''}
+    </div>
+  `;
+  document.getElementById('app-shell').innerHTML = html;
+};
+
+App.renderTopBar = function(t) {
+  const s = this.state;
+  const title = { notify: '알림', notice: '공지', calendar: '', todo: 'To do list', help: '사용 설정' }[s.tab];
+  return `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', paddingTop:'calc(10px + env(safe-area-inset-top))', paddingLeft:16, paddingRight:16, paddingBottom:6, flexShrink:0 })}">
+      <div style="${this.styleStr({ width:34, height:34, borderRadius:17, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, border:`1px solid ${t.border}`, cursor:'pointer', flexShrink:0 })}" onclick="App.toggleDark()">
+        ${s.dark
+          ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" stroke="${t.text}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
+          : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="4" stroke="${t.text}" stroke-width="2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="${t.text}" stroke-width="2" stroke-linecap="round"/></svg>`}
+      </div>
+      ${s.tab === 'calendar' ? `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:7 })}">
+          <img src="logo-mark.png" alt="신박한 캘린더 로고" style="${this.styleStr({ width:24, height:24, objectFit:'contain', flexShrink:0 })}" />
+          <div style="${this.styleStr({ fontSize:20, fontWeight:800, color:t.text, letterSpacing:'-0.3px', fontFamily:"'Jua',sans-serif" })}">신박한 캘린더</div>
+        </div>` : `<div style="${this.styleStr({ fontSize:21, fontWeight:800, color:t.text, fontFamily:"'Jua',sans-serif" })}">${title}</div>`}
+      ${s.tab === 'calendar'
+        ? (s.isLoggedIn
+            ? `<div style="${this.styleStr({ width:34, height:34, borderRadius:17, background:t.primary, color:'#fff', fontSize:13, fontWeight:800, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', flexShrink:0 })}" onclick="App.setState({authScreen:'profile'})">${this.esc((s.authName.trim()[0]) || 'U')}</div>`
+            : `<div style="${this.styleStr({ padding:'7px 12px', borderRadius:20, background:t.primary, color:'#fff', fontSize:12.5, fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' })}" onclick="App.setState({authScreen:'auth', authMode:'login'})">로그인</div>`)
+        : `<div style="width:34px"></div>`}
+    </div>
+  `;
+};
+
+App.renderCalendar = function(t) {
+  const s = this.state;
+  const weeks = this.buildGrid(s.dark);
+  const monthLabel = `${s.viewYear}년 ${s.viewMonth + 1}월`;
+  const gridLineColor = s.dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.045)';
+
+   // ==================== 캘린더 칸 크기 - 여기 숫자만 바꾸면 됨 (다 따로따로 조절 가능) ====================
+  const CELL_W = 55.5;          // 날짜 칸 너비
+  const CELL_H = 22;            // 날짜 칸(숫자 줄) 높이
+  const ROW_GAP = 80;           // 주(week) 한 줄과 다음 줄 사이 간격
+  const DAY_CIRCLE_SIZE = 20;   // 날짜 숫자 원 크기 (지름)
+  const DAY_FONT_SIZE = 13;     // 날짜 숫자 폰트 크기
+  const BAR_H = 19;             // 일정 바 하나의 높이
+  const BAR_GAP = 22;           // 일정 바가 여러 개 겹칠 때, 바와 바 사이 세로 간격
+  const BAR_FONT_SIZE = 11;     // 일정 바 안의 글씨 크기
+  const WEEKDAY_FONT_SIZE = 13; // 요일(일/월/화...) 글씨 크기
+  const WEEKDAY_ROW_PADDING = '3px 0'; // 요일 줄 위아래 여백
+  // ============================================================================================
+
+  const GRID_W = CELL_W * 7;
+
+  const weeksHtml = weeks.map((week, wi) => {
+    const daysHtml = week.days.map(day => `
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'center', width:CELL_W, height:CELL_H, cursor:'pointer' })}" onclick="App.setState({selectedDate:'${day.iso}'})">
+        <div style="${this.styleStr({
+          width:DAY_CIRCLE_SIZE, height:DAY_CIRCLE_SIZE, borderRadius:DAY_CIRCLE_SIZE/2, display:'flex', alignItems:'center', justifyContent:'center',
+          fontSize:DAY_FONT_SIZE, fontWeight: day.isToday ? 800 : 600,
+          color: day.isSelected ? '#fff' : (day.inMonth ? t.text : t.textFaint),
+          background: day.isSelected ? t.primary : 'transparent',
+          border: (day.isToday && !day.isSelected) ? `1.5px solid ${t.primary}` : '1.5px solid transparent',
+        })}">${day.day}</div>
+      </div>
+    `).join('');
+
+    const barsHtml = week.bars.map(bar => `
+      <div style="${this.styleStr({
+        position:'absolute', top: bar.lane * BAR_GAP, left: `calc(${bar.left}%)`, width: `calc(${bar.width}% - 3px)`, height:BAR_H,
+        background: bar.color, color:'#fff', fontSize:BAR_FONT_SIZE, fontWeight:800, display:'flex', alignItems:'center',
+        paddingLeft:7, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis', cursor:'pointer',
+        marginLeft: bar.isCapLeft ? '1.5px' : '0',
+        boxShadow: '0 1px 2px rgba(0,0,0,0.15)',
+        borderRadius: `${bar.isCapLeft?8:3}px ${bar.isCapRight?8:3}px ${bar.isCapRight?8:3}px ${bar.isCapLeft?8:3}px`,
+      })}" onclick="event.stopPropagation(); App.openDetail('${bar.id}')">${this.esc(bar.title)}</div>
+    `).join('');
+
+    const hiddenHtml = week.hiddenCount > 0
+      ? `<div style="${this.styleStr({ position:'absolute', top: week.laneCount*BAR_GAP, left:4, fontSize:10, fontWeight:700, color:t.textFaint })}">+${week.hiddenCount}건 더보기</div>`
+      : '';
+
+    return `
+      <div style="${this.styleStr({ flexShrink:0, display:'flex', flexDirection:'column' })}">
+        <div style="${this.styleStr({ height:1, flexShrink:0, marginBottom:3, background: wi>0 ? gridLineColor : 'transparent' })}"></div>
+        <div style="${this.styleStr({ display:'flex' })}">${daysHtml}</div>
+        <div style="${this.styleStr({ position:'relative', height: week.laneCount*BAR_GAP + (week.hiddenCount>0?14:0), flexShrink:0 })}">${barsHtml}${hiddenHtml}</div>
+      </div>
+    `;
+  }).join('');
+
+  const weekdayHtml = WEEKDAY_NAMES.map((n, i) => `
+    <div style="${this.styleStr({ width:CELL_W, textAlign:'center', fontSize:WEEKDAY_FONT_SIZE, fontWeight:700, padding:WEEKDAY_ROW_PADDING, color: i===0?'#EF6F5B':(i===6?'#4F7FE0':t.textFaint) })}">${n}</div>
+  `).join('');
+
+  // 세로 구분선 - CELL_W 값에 정확히 맞춰서 그림 (CELL_W를 바꾸면 이것도 자동으로 맞춰짐)
+  const verticalLines = `repeating-linear-gradient(to right, transparent, transparent ${CELL_W - 1}px, ${gridLineColor} ${CELL_W - 1}px, ${gridLineColor} ${CELL_W}px)`;
+
+  return `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'center', gap:20, padding:'2px 16px 4px', flexShrink:0 })}">
+      <div style="${this.styleStr({ width:26, height:26, borderRadius:13, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.prevMonth()">
+        <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="${this.styleStr({ fontSize:16, fontWeight:700, color:t.text, minWidth:100, textAlign:'center', fontFamily:"'Jua',sans-serif", cursor:'pointer' })}" onclick="App.openYearMonthPicker()">${monthLabel} ▾</div>
+      <div style="${this.styleStr({ width:26, height:26, borderRadius:13, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.nextMonth()">
+        <svg width="9" height="15" viewBox="0 0 9 15"><path d="M1 1l7 6.5-7 6.5" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+    </div>
+    <div style="${this.styleStr({ display:'flex', justifyContent:'center', flexShrink:0, borderBottom:`1px solid ${t.border}`, padding:'0 0 4px' })}">${weekdayHtml}</div>
+    <div style="${this.styleStr({ flex:1, display:'flex', justifyContent:'center', minHeight:0, overflow:'hidden' })}">
+      <div style="${this.styleStr({ width:GRID_W, height:'100%', display:'flex', flexDirection:'column', justifyContent:'flex-start', gap:ROW_GAP, padding:'6px 0 2px', overflow:'auto', position:'relative', backgroundImage:verticalLines })}">${weeksHtml}</div>
+    </div>
+  `;
+};
+
+App.renderNotify = function(t) {
+  const s = this.state;
+  const groupsMap = {};
+  s.events.forEach(ev => { (groupsMap[ev.startDate] = groupsMap[ev.startDate] || []).push(ev); });
+  const dates = Object.keys(groupsMap).sort();
+
+  const legend = ['high','medium','low'].map(k => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:6, fontSize:12, fontWeight:700, color:t.textMuted })}">
+      <div style="${this.styleStr({ width:9, height:9, borderRadius:5, background: PRIORITY_META[k].color })}"></div>
+      <div>${PRIORITY_META[k].label}</div>
+    </div>
+  `).join('');
+
+  const groupsHtml = dates.length === 0
+    ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:13, padding:'60px 20px' })}">아직 등록된 일정이 없어요</div>`
+    : dates.map(dateIso => {
+      const items = groupsMap[dateIso].slice().sort((a,b) => a.start.localeCompare(b.start));
+      const itemsHtml = items.map(ev => `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, padding:'11px 4px', borderBottom:`1px solid ${t.border}`, cursor:'pointer' })}" onclick="App.openDetail('${ev._id}')">
+          <div style="${this.styleStr({ width:9, height:9, borderRadius:5, background: (PRIORITY_META[ev.priority]||PRIORITY_META.medium).color, flexShrink:0 })}"></div>
+          <div style="${this.styleStr({ flex:1, fontSize:14.5, fontWeight:600, color:t.text })}">${this.esc(ev.title)}</div>
+          <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, flexShrink:0 })}">${ev.startDate===ev.endDate ? `${this.formatTime(ev.start)} - ${this.formatTime(ev.end)}` : `${this.formatDue(ev.startDate)} ~ ${this.formatDue(ev.endDate)}`}</div>
+        </div>
+      `).join('');
+      return `<div style="${this.styleStr({ fontSize:13, fontWeight:800, color:t.textMuted, margin:'16px 0 8px' })}">${this.formatDayHeader(dateIso)}</div>${itemsHtml}`;
+    }).join('');
+
+  return `
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:18, padding:'10px 4px 14px', borderBottom:`1px solid ${t.border}`, marginBottom:2 })}">${legend}</div>
+      ${groupsHtml}
+    </div>
+  `;
+};
+
+App.renderNotice = function(t) {
+  const s = this.state;
+  const r = s.parsedResult ? s.parsedResult.result : null;
+  const canAnalyze = (s.noticeText.trim() || s.imageFile) && !s.analyzing;
+
+  const addBtnStyle = (added) => this.styleStr({ padding:'8px 12px', borderRadius:10, background: added ? t.surfaceAlt : t.primary, color: added ? t.textMuted : '#fff', fontSize:12.5, fontWeight:700, cursor: added?'default':'pointer', border: added?`1px solid ${t.border}`:'none', whiteSpace:'nowrap', flexShrink:0 });
+
+  return `
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px', display:'flex', flexDirection:'column', gap:14 })}">
+      <div style="${this.styleStr({ display:'flex', justifyContent:'flex-end' })}">
+        <div style="${this.styleStr({ padding:'6px 12px', borderRadius:20, background:t.surfaceAlt, border:`1px solid ${t.border}`, fontSize:12, fontWeight:700, color:t.textMuted, cursor:'pointer' })}" onclick="App.setState({tab:'help'})">⚙️ 사용 설정</div>
+      </div>
+      <div style="${this.styleStr({ border:`1.5px dashed ${t.border}`, borderRadius:14, padding:'20px 14px', display:'flex', flexDirection:'column', alignItems:'center', gap:6, color:t.textMuted, fontSize:12.5, cursor:'pointer', textAlign:'center' })}" onclick="document.getElementById('image-input').click()">
+        ${s.imagePreviewUrl
+          ? `<img src="${s.imagePreviewUrl}" style="max-width:100%;max-height:140px;border-radius:8px;" />`
+          : `<svg width="26" height="26" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="${t.textMuted}" stroke-width="1.6"/><path d="M3 15l5-5 4 4 3-3 6 6" stroke="${t.textMuted}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+             <div>스크린샷을 탭하여 업로드</div>
+             <div style="font-size:11px">카카오톡 · LMS · 이메일 캡처 이미지</div>`}
+      </div>
+      <input type="file" id="image-input" accept="image/*" style="display:none" onchange="App.onImageSelected(event)" />
+
+      <div>
+        <div style="${this.styleStr({ fontSize:12.5, fontWeight:700, color:t.primary, cursor:'pointer', marginBottom:6, display:'inline-block' })}" onclick="App.fillSample()">예시 공지 붙여넣기</div>
+        <textarea style="${this.styleStr({ width:'100%', minHeight:110, padding:12, borderRadius:14, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13.5, fontFamily:"'Jua',sans-serif", resize:'none', lineHeight:1.5 })}" placeholder="공지 텍스트를 여기에 붙여넣으세요" oninput="App.state.noticeText=this.value">${this.esc(s.noticeText)}</textarea>
+      </div>
+
+      <div style="${this.styleStr({ padding:14, borderRadius:14, background: canAnalyze ? t.primary : t.border, color: canAnalyze ? '#fff' : t.textFaint, fontWeight:800, fontSize:15, textAlign:'center', cursor: canAnalyze ? 'pointer':'default' })}" onclick="${canAnalyze ? 'App.analyze()' : ''}">${s.analyzing ? '분석 중…' : 'AI로 분석하기'}</div>
+
+      ${s.analyzing ? `<div style="${this.styleStr({ textAlign:'center', color:t.textMuted, fontSize:13, padding:'4px 0' })}">AI가 공지를 분석하고 있어요…</div>` : ''}
+      ${s.analyzeError ? `<div style="${this.styleStr({ textAlign:'center', color:'#EF6F5B', fontSize:12.5, padding:'4px 0' })}">${this.esc(s.analyzeError)}</div>` : ''}
+
+      ${r ? `
+        <div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:16, padding:16, display:'flex', flexDirection:'column', gap:12 })}">
+          <div style="${this.styleStr({ alignSelf:'flex-start', padding:'4px 10px', borderRadius:20, background: PRIORITY_META[r.priority].color, color:'#fff', fontSize:11, fontWeight:800 })}">중요도 ${PRIORITY_META[r.priority].label}</div>
+          <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(r.summary)}</div>
+          ${r.event ? `
+            <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, padding:'10px 12px', background:t.surfaceAlt, borderRadius:12 })}">
+              <div>
+                <div style="${this.styleStr({ fontSize:13.5, fontWeight:700, color:t.text })}">일정 · ${this.esc(r.event.title)}</div>
+                <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:2 })}">${this.formatDue(r.event.startDate)} · ${this.formatTime(r.event.start)}~${this.formatTime(r.event.end)}</div>
+              </div>
+              <div style="${addBtnStyle(s.addedEvent)}" onclick="${s.addedEvent?'':'App.addParsedEvent()'}">${s.addedEvent ? '추가됨' : '캘린더에 추가'}</div>
+            </div>` : ''}
+          ${r.todo ? `
+            <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, padding:'10px 12px', background:t.surfaceAlt, borderRadius:12 })}">
+              <div>
+                <div style="${this.styleStr({ fontSize:13.5, fontWeight:700, color:t.text })}">할일 · ${this.esc(r.todo.title)}</div>
+                <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:2 })}">마감 ${this.formatDue(r.todo.due)}</div>
+              </div>
+              <div style="${addBtnStyle(s.addedTodo)}" onclick="${s.addedTodo?'':'App.addParsedTodo()'}">${s.addedTodo ? '추가됨' : '할일에 추가'}</div>
+            </div>` : ''}
+        </div>
+      ` : ''}
+    </div>
+  `;
+};
+
+App.renderTodo = function(t) {
+  const s = this.state;
+  const todos = s.todos.filter(td => td.due === s.todoDate);
+  const rows = todos.length === 0
+    ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:13, padding:'60px 20px' })}">이 날은 할일이 없어요</div>`
+    : todos.map(td => `
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:12, padding:'13px 4px', borderBottom:`1px solid ${t.border}`, opacity: td.done?0.5:1 })}">
+        <div style="${this.styleStr({ width:22, height:22, borderRadius:7, border:`2px solid ${td.done?t.primary:t.border}`, background: td.done?t.primary:'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, cursor:'pointer' })}" onclick="App.toggleTodo('${td._id}')">
+          ${td.done ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+        </div>
+        <div style="${this.styleStr({ flex:1, fontSize:14.5, fontWeight:600, color:t.text, textDecoration: td.done?'line-through':'none' })}">${this.esc(td.title)}</div>
+      </div>
+    `).join('');
+
+  return `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'center', gap:20, padding:'2px 16px 10px', flexShrink:0 })}">
+      <div style="${this.styleStr({ width:28, height:28, borderRadius:14, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.setState({todoDate: App.addDays(App.state.todoDate,-1)})">
+        <svg width="8" height="14" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="${this.styleStr({ fontSize:16, fontWeight:700, color:t.text, minWidth:130, textAlign:'center' })}">${this.formatDayHeader(s.todoDate)}</div>
+      <div style="${this.styleStr({ width:28, height:28, borderRadius:14, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.setState({todoDate: App.addDays(App.state.todoDate,1)})">
+        <svg width="8" height="14" viewBox="0 0 9 15"><path d="M1 1l7 6.5-7 6.5" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+    </div>
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">${rows}</div>
+    <div style="${this.styleStr({ position:'absolute', right:18, bottom:'calc(78px + env(safe-area-inset-bottom))', width:52, height:52, borderRadius:26, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 8px 20px rgba(0,0,0,0.28)', cursor:'pointer', zIndex:30 })}" onclick="App.openTodoModal()">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg>
+    </div>
+  `;
+};
+
+App.renderTodoModal = function(t) {
+  const s = this.state;
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:50, padding:20 })}" onclick="App.closeTodoModal()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:340, background:t.surface, borderRadius:20, padding:'18px 18px 22px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14 })}">
+          <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">할일 추가</div>
+          <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeTodoModal()">✕</div>
+        </div>
+        <div style="margin-bottom:14px">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">할 일</div>
+          <input id="todo-draft-input" style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.todoDraftTitle)}" oninput="App.state.todoDraftTitle=this.value" placeholder="예: 경진대회 신청서 제출하기">
+        </div>
+        <div style="${this.styleStr({ fontSize:12, color:t.textMuted, marginBottom:14 })}">${this.formatDayHeader(s.todoDate)}에 추가돼요</div>
+        <div style="${this.styleStr({ display:'flex', gap:10 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeTodoModal()">취소</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveManualTodo()">저장</div>
+        </div>
+      </div>
+    </div>
+  `;
+};
+
+App.renderHelp = function(t) {
+  const section = (title, bodyHtml) => `
+    <div style="${this.styleStr({ marginBottom:22 })}">
+      <div style="${this.styleStr({ fontSize:15.5, fontWeight:800, color:t.primary, marginBottom:8, fontFamily:"'Jua',sans-serif" })}">${title}</div>
+      <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.7, color:t.text })}">${bodyHtml}</div>
+    </div>
+  `;
+  const step = (num, text) => `
+    <div style="${this.styleStr({ display:'flex', gap:10, marginBottom:8 })}">
+      <div style="${this.styleStr({ width:22, height:22, borderRadius:11, background:t.primary, color:'#fff', fontSize:12, fontWeight:800, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 })}">${num}</div>
+      <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.6, color:t.text, paddingTop:1 })}">${text}</div>
+    </div>
+  `;
+  const codeBox = (text) => `<div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:10, padding:'10px 12px', fontSize:11.5, color:t.text, wordBreak:'break-all', margin:'6px 0 10px', fontFamily:'monospace' })}">${this.esc(text)}</div>`;
+
+  return `
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'8px 16px 40px' })}">
+      <div style="${this.styleStr({ fontSize:19, fontWeight:800, color:t.text, marginBottom:4, fontFamily:"'Jua',sans-serif" })}">사용 설정</div>
+      <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, marginBottom:20 })}">앱을 더 편하게 쓰는 방법을 정리했어요. 처음 접속했을 때 봤던 안내와 같은 내용이에요.</div>
+
+      <div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:14, padding:16, marginBottom:22 })}">
+        <div style="${this.styleStr({ fontSize:14.5, fontWeight:800, color:t.text, marginBottom:4 })}">🔔 푸시 알림</div>
+        <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, marginBottom:12, lineHeight:1.5 })}">앱을 안 켜놔도 일정 알림을 받으려면 켜야 해요. (아이폰은 "홈 화면에 추가" 한 상태에서만 작동해요)</div>
+        <div style="${this.styleStr({ padding:12, borderRadius:10, background: this.state.pushEnabled ? t.surface : t.primary, color: this.state.pushEnabled ? t.textMuted : '#fff', fontWeight:700, fontSize:13.5, textAlign:'center', cursor: this.state.pushEnabled ? 'default':'pointer', border: this.state.pushEnabled ? `1px solid ${t.border}` : 'none' })}" onclick="${this.state.pushEnabled ? '' : 'App.enablePushNotifications()'}">${this.state.pushEnabled ? '✅ 알림 켜짐' : '푸시 알림 켜기'}</div>
+      </div>
+
+      ${section('① 홈 화면에 추가하기', `
+        <p style="margin:0 0 10px">브라우저 주소창 없이, 진짜 앱처럼 아이콘을 눌러서 바로 열 수 있어요.</p>
+        ${step(1, 'Safari 하단(또는 상단)의 공유 버튼을 탭하세요.')}
+        ${step(2, '메뉴에서 "홈 화면에 추가"를 선택하세요.')}
+        ${step(3, '오른쪽 위 "추가"를 누르면 완료! 이제 홈 화면에 신박한 캘린더 아이콘이 생겨요.')}
+      `)}
+
+      ${section('② 카톡 공지, 단축어로 한 번에 처리하기', `
+        <p style="margin:0 0 10px">카카오톡에서 공지를 공유할 때, 앱을 열지 않고도 AI가 알아서 일정/할일까지 저장해주는 자동화예요. 아이폰 "단축어" 앱에서 한 번만 설정해두면 돼요.</p>
+        ${step(1, '단축어 앱 → 오른쪽 위 + 버튼으로 새 단축어 만들기')}
+        ${step(2, '동작 검색에서 "공유 시트에서 앱 및 콘텐츠 받기"가 맨 위에 자동으로 들어가 있는지 확인')}
+        ${step(3, '동작 검색에서 "URL의 콘텐츠 가져오기"를 추가')}
+        ${step(4, 'URL 칸에 서버 주소 + <b>/api/notices/quick-add</b> 를 입력')}
+        ${codeBox('예: http://192.168.0.7:4000/api/notices/quick-add')}
+        ${step(5, '세부사항 펼치기 → 메소드를 POST로 변경')}
+        ${step(6, '본문 요청을 JSON으로 선택하고, 키에 정확히 소문자로 "text"를 입력, 값에는 파란색 "공유 시트 입력" 변수 칩을 넣기')}
+        ${step(7, '(선택) "사전 값 가져오기" 동작을 추가해서 방금 결과의 "message" 값을 가져오고, "알림 표시" 동작으로 연결하면 저장 완료 알림까지 뜸')}
+        ${step(8, '단축어 이름 지정 후 완료. 이제 단축어 세부사항에서 "공유 시트에서 보기"가 켜져있는지 꼭 확인')}
+        <p style="margin:10px 0 0; color:${t.textMuted}; font-size:12px">※ 서버 주소는 컴퓨터 로컬 IP라서 폰이 같은 와이파이에 연결돼 있어야 작동해요. 나중에 실제 배포하면 그 주소로 바꿔야 어디서든 작동해요.</p>
+      `)}
+
+      ${section('③ 자주 묻는 것', `
+        <p style="margin:0 0 8px"><b>일정에 종료일이 왜 시작일이랑 같이 바뀌나요?</b><br/>하루짜리 일정이 대부분이라, 시작 날짜를 바꾸면 종료 날짜도 자동으로 따라가요. 여러 날짜에 걸친 일정을 만들고 싶으면 종료 날짜만 따로 늘려주면 돼요.</p>
+        <p style="margin:0"><b>다크모드는 어디서 켜나요?</b><br/>캘린더 화면 왼쪽 위 해/달 아이콘을 탭하면 바로 전환돼요.</p>
+      `)}
+    </div>
+  `;
+};
+
+App.renderFab = function(t) {
+  return `
+    <div style="${this.styleStr({ position:'absolute', right:18, bottom:'calc(78px + env(safe-area-inset-bottom))', width:52, height:52, borderRadius:26, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 8px 20px rgba(0,0,0,0.28)', cursor:'pointer', zIndex:30 })}" onclick="App.openAddModal()">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg>
+    </div>
+  `;
+};
+
+App.renderTabBar = function(t) {
+  const s = this.state;
+  const color = (key) => s.tab === key ? t.primary : t.textFaint;
+  const btn = () => this.styleStr({ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:4, padding:'8px 0 4px', cursor:'pointer' });
+  const label = (key) => this.styleStr({ fontSize:10.5, fontWeight:700, color:color(key), whiteSpace:'nowrap' });
+  return `
+    <div style="${this.styleStr({ display:'flex', flexShrink:0, borderTop:`1px solid ${t.border}`, background:t.surface, paddingBottom:'calc(6px + env(safe-area-inset-bottom))' })}">
+      <div style="${btn()}" onclick="App.setState({tab:'calendar'})">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5" width="17" height="15" rx="2.5" stroke="${color('calendar')}" stroke-width="1.8"/><path d="M3.5 9.5h17M8 3v4M16 3v4" stroke="${color('calendar')}" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <div style="${label('calendar')}">캘린더</div>
+      </div>
+      <div style="${btn()}" onclick="App.setState({tab:'notice'})">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="${color('notice')}" stroke-width="1.8"/><path d="M8 8h8M8 12h5" stroke="${color('notice')}" stroke-width="1.8" stroke-linecap="round"/><path d="M8 16.5h3" stroke="${color('notice')}" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <div style="${label('notice')}">공지</div>
+      </div>
+      <div style="${btn()}" onclick="App.setState({tab:'notify'})">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3a5 5 0 00-5 5v3.2c0 .6-.2 1.2-.6 1.7L5 15h14l-1.4-2.1c-.4-.5-.6-1.1-.6-1.7V8a5 5 0 00-5-5z" stroke="${color('notify')}" stroke-width="1.8" stroke-linejoin="round"/><path d="M9.5 18a2.5 2.5 0 005 0" stroke="${color('notify')}" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <div style="${label('notify')}">알림</div>
+      </div>
+      <div style="${btn()}" onclick="App.setState({tab:'todo'})">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="4" stroke="${color('todo')}" stroke-width="1.8"/><path d="M8.5 12.5l2.3 2.3L16 10" stroke="${color('todo')}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <div style="${label('todo')}">To do list</div>
+      </div>
+    </div>
+  `;
+};
+
+App.renderEventModal = function(t) {
+  const s = this.state;
+  const f = s.form;
+  const track = (on) => this.styleStr({ width:46, height:26, borderRadius:13, background: on?t.primary:t.border, position:'relative', cursor:'pointer' });
+  const knob = (on) => this.styleStr({ position:'absolute', top:2, left: on?'22px':'2px', width:22, height:22, borderRadius:11, background:'#fff', boxShadow:'0 1px 3px rgba(0,0,0,0.3)', transition:'left .15s' });
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:50, padding:16 })}" onclick="App.closeModal()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:340, maxHeight:'85%', overflow:'auto', background:t.surface, borderRadius:20, padding:'18px 18px 22px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:10 })}">
+          <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">${s.modalMode==='edit'?'일정 수정':'일정 추가'}</div>
+          <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeModal()">✕</div>
+        </div>
+        <div style="margin-bottom:9px">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">제목</div>
+          <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(f.title)}" oninput="App.state.form.title=this.value" placeholder="일정 제목">
+        </div>
+        <div style="${this.styleStr({ display:'flex', gap:10, marginBottom:9 })}">
+          <div style="flex:1">
+            <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">시작 날짜</div>
+            <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="date" value="${f.startDate}" onchange="App.onStartDateChange(this.value)">
+          </div>
+          <div style="flex:1">
+            <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">종료 날짜</div>
+            <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="date" value="${f.endDate}" oninput="App.state.form.endDate=this.value">
+          </div>
+        </div>
+        <div style="${this.styleStr({ display:'flex', gap:10, marginBottom:9 })}">
+          <div style="flex:1">
+            <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">시작 시간</div>
+            <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="time" value="${f.start}" oninput="App.state.form.start=this.value">
+          </div>
+          <div style="flex:1">
+            <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">종료 시간</div>
+            <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="time" value="${f.end}" oninput="App.state.form.end=this.value">
+          </div>
+        </div>
+        <div style="margin-bottom:9px">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">중요도</div>
+          <select style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" onchange="App.state.form.priority=this.value">
+            ${['high','medium','low'].map(k => `<option value="${k}" ${f.priority===k?'selected':''}>${PRIORITY_META[k].label}</option>`).join('')}
+          </select>
+        </div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0' })}">
+          <div style="${this.styleStr({ fontSize:14.5, fontWeight:600, color:t.text })}">알람</div>
+          <div style="${track(f.alarm)}" onclick="App.state.form.alarm=!App.state.form.alarm; App.render()"><div style="${knob(f.alarm)}"></div></div>
+        </div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0' })}">
+          <div style="${this.styleStr({ fontSize:14.5, fontWeight:600, color:t.text })}">알림</div>
+          <div style="${track(f.notify)}" onclick="App.state.form.notify=!App.state.form.notify; App.render()"><div style="${knob(f.notify)}"></div></div>
+        </div>
+        <div style="${this.styleStr({ display:'flex', gap:10, marginTop:6 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeModal()">취소</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveEvent()">저장</div>
+        </div>
+        ${s.modalMode==='edit' ? `<div style="${this.styleStr({ textAlign:'center', color:'#EF6F5B', fontSize:13, fontWeight:700, marginTop:14, cursor:'pointer' })}" onclick="App.deleteEvent()">일정 삭제</div>` : ''}
+      </div>
+    </div>
+  `;
+};
+
+App.renderDetailModal = function(t) {
+  const s = this.state;
+  const ev = s.events.find(e => e._id === s.detailEventId);
+  if (!ev) return '';
+  const dateLabel = ev.startDate === ev.endDate
+    ? `${this.formatDue(ev.startDate)} ${this.formatTime(ev.start)}~${this.formatTime(ev.end)}`
+    : `${this.formatDue(ev.startDate)} ~ ${this.formatDue(ev.endDate)}`;
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:50, padding:20 })}" onclick="App.closeDetail()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:340, maxHeight:'85%', overflow:'auto', background:t.surface, borderRadius:20, padding:'18px 18px 22px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:16 })}">
+          <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">${this.esc(ev.title)}</div>
+          <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeDetail()">✕</div>
+        </div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginBottom:14 })}">
+          <div style="${this.styleStr({ padding:'4px 10px', borderRadius:20, background: (PRIORITY_META[ev.priority]||PRIORITY_META.medium).color, color:'#fff', fontSize:11, fontWeight:800 })}">중요도 ${(PRIORITY_META[ev.priority]||PRIORITY_META.medium).label}</div>
+          <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, fontWeight:600 })}">${dateLabel}</div>
+        </div>
+        <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted, margin:'14px 0 6px' })}">AI 요약</div>
+        <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(ev.aiSummary || '직접 추가한 일정이에요.')}</div>
+        ${ev.sourceContent ? `
+          <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', margin:'14px 0 6px', cursor:'pointer' })}" onclick="App.toggleDetailSource()">
+            <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted })}">원본 자료</div>
+            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" style="${this.styleStr({ transform: s.showDetailSource ? 'rotate(180deg)' : 'rotate(0deg)', transition:'transform .15s' })}"><path d="M6 9l6 6 6-6" stroke="${t.textMuted}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </div>
+        ` : ''}
+        ${(s.showDetailSource && ev.sourceType === 'text' && ev.sourceContent) ? `
+          <div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:12, padding:12, fontSize:12.5, lineHeight:1.6, color:t.text, whiteSpace:'pre-wrap', maxHeight:160, overflow:'auto' })}">${this.esc(ev.sourceContent)}</div>
+        ` : ''}
+        ${(s.showDetailSource && ev.sourceType === 'image' && ev.sourceContent) ? `
+          <div style="${this.styleStr({ border:`1.5px dashed ${t.border}`, borderRadius:12, padding:'22px 12px', display:'flex', flexDirection:'column', alignItems:'center', gap:8, color:t.textMuted, fontSize:12, textAlign:'center' })}">
+            <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="${t.textMuted}" stroke-width="1.6"/><path d="M3 15l5-5 4 4 3-3 6 6" stroke="${t.textMuted}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div>${this.esc(ev.sourceContent)}</div>
+          </div>
+        ` : ''}
+        <div style="${this.styleStr({ display:'flex', gap:10, marginTop:16 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:14, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeDetail(); App.openEditModal('${ev._id}')">수정</div>
+        </div>
+      </div>
+    </div>
+  `;
+};
+
+App.renderAuth = function(t) {
+  const s = this.state;
+  const isSignup = s.authMode === 'signup';
+  const isFind = s.authMode === 'find-id' || s.authMode === 'find-pw';
+
+  if (isFind) {
+    const isFindId = s.authMode === 'find-id';
+    return `
+      <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
+        <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authMode:'login'})">
+          <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+        <div style="${this.styleStr({ fontSize:23, fontWeight:800, color:t.text, marginBottom:6 })}">${isFindId?'아이디 찾기':'비밀번호 찾기'}</div>
+        <div style="${this.styleStr({ fontSize:13, color:t.textMuted, marginBottom:26 })}">가입할 때 사용한 이메일을 입력하면 ${isFindId?'아이디를':'재설정 링크를'} 보내드려요.</div>
+        <div style="margin-bottom:14px">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이메일</div>
+          <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authFindEmail)}" oninput="App.state.authFindEmail=this.value" placeholder="you@example.com">
+        </div>
+        <div style="${this.styleStr({ padding:15, borderRadius:14, background:t.primary, color:'#fff', fontWeight:800, fontSize:15, textAlign:'center', cursor:'pointer', marginTop:6 })}" onclick="App.submitFindAccount()">${isFindId?'아이디 찾기':'재설정 메일 보내기'}</div>
+        ${s.authFindMessage ? `<div style="${this.styleStr({ marginTop:16, padding:12, borderRadius:10, background:t.surfaceAlt, color:t.text, fontSize:13, lineHeight:1.5 })}">${this.esc(s.authFindMessage)}</div>` : ''}
+        <div style="${this.styleStr({ textAlign:'center', fontSize:12.5, color:t.primary, marginTop:20, cursor:'pointer', fontWeight:700 })}" onclick="App.setState({authMode:'login'})">로그인으로 돌아가기</div>
+      </div>
+    `;
+  }
+
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
+      <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authScreen:null})">
+        <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="${this.styleStr({ fontSize:23, fontWeight:800, color:t.text, marginBottom:6 })}">${isSignup?'회원가입':'로그인'}</div>
+      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, marginBottom:26 })}">${isSignup?'몇 가지 정보만 입력하면 바로 시작할 수 있어요.':'다시 만나서 반가워요.'}</div>
+      ${isSignup ? `
+        <div style="margin-bottom:14px">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이름</div>
+          <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authName)}" oninput="App.state.authName=this.value" placeholder="이름">
+        </div>` : ''}
+      <div style="margin-bottom:14px">
+        <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이메일</div>
+        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authEmail)}" oninput="App.state.authEmail=this.value" placeholder="you@example.com">
+      </div>
+      <div style="margin-bottom:14px">
+        <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">비밀번호</div>
+        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="password" value="${this.esc(s.authPassword)}" oninput="App.state.authPassword=this.value" placeholder="••••••••">
+      </div>
+      ${!isSignup ? `
+        <div style="${this.styleStr({ display:'flex', justifyContent:'flex-end', gap:12, marginBottom:6, fontSize:12, color:t.textMuted })}">
+          <div style="${this.styleStr({ cursor:'pointer' })}" onclick="App.setState({authMode:'find-id', authFindMessage:''})">아이디 찾기</div>
+          <div style="${this.styleStr({ color:t.border })}">|</div>
+          <div style="${this.styleStr({ cursor:'pointer' })}" onclick="App.setState({authMode:'find-pw', authFindMessage:''})">비밀번호 찾기</div>
+        </div>` : ''}
+      <div style="${this.styleStr({ padding:15, borderRadius:14, background:t.primary, color:'#fff', fontWeight:800, fontSize:15, textAlign:'center', cursor:'pointer', marginTop:6 })}" onclick="App.setState({isLoggedIn:true, authScreen:null})">${isSignup?'회원가입':'로그인'}</div>
+      <div style="${this.styleStr({ display:'flex', justifyContent:'center', gap:5, marginTop:20, fontSize:13, color:t.textMuted })}">
+        <div>${isSignup?'이미 계정이 있으신가요?':'계정이 없으신가요?'}</div>
+        <div style="${this.styleStr({ color:t.primary, fontWeight:800, cursor:'pointer' })}" onclick="App.setState({authMode: App.state.authMode==='login'?'signup':'login'})">${isSignup?'로그인':'회원가입'}</div>
+      </div>
+      <div style="${this.styleStr({ textAlign:'center', fontSize:12.5, color:t.textFaint, marginTop:18, cursor:'pointer', textDecoration:'underline' })}" onclick="App.setState({authScreen:null})">로그인 없이 둘러보기</div>
+    </div>
+  `;
+};
+
+App.renderProfile = function(t) {
+  const s = this.state;
+  const initial = (s.authName.trim()[0]) || 'U';
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
+      <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authScreen:null})">
+        <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </div>
+      <div style="${this.styleStr({ width:64, height:64, borderRadius:32, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:24, fontWeight:800, margin:'0 auto 14px' })}">${this.esc(initial)}</div>
+      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, textAlign:'center' })}">${this.esc(s.authName.trim() || '사용자')}</div>
+      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, textAlign:'center', marginBottom:26 })}">${this.esc(s.authEmail.trim() || 'guest@example.com')}</div>
+      <div style="${this.styleStr({ display:'flex', flexDirection:'column', gap:2 })}">
+        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">계정 정보</div>
+        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">공지 연동 설정</div>
+        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">알림 설정</div>
+        <div style="${this.styleStr({ padding:'14px 4px', fontSize:14.5, fontWeight:700, color:'#EF6F5B', textAlign:'center', marginTop:18, cursor:'pointer' })}" onclick="App.setState({isLoggedIn:false, authScreen:null})">로그아웃</div>
+      </div>
+    </div>
+  `;
+};
+
+// ---------- 이벤트 핸들러 ----------
+App.onStartDateChange = function(value) {
+  const f = this.state.form;
+  const oldStart = f.startDate;
+  f.startDate = value;
+  // 종료 날짜를 아직 따로 늘려두지 않았거나(=시작일과 같았거나), 시작일이 종료일보다 뒤로 가버린 경우
+  // 자동으로 종료 날짜도 같이 맞춰줌 (하루짜리 일정이 대부분이라 이게 훨씬 편함)
+  if (f.endDate === oldStart || f.endDate < value) {
+    f.endDate = value;
+  }
+  this.render();
+};
+
+App.toggleDark = function() { this.setState(s => ({ dark: !s.dark })); };
+App.submitFindAccount = function() {
+  const email = this.state.authFindEmail.trim();
+  if (!email) return;
+  const isFindId = this.state.authMode === 'find-id';
+  // 실제 계정 시스템이 아직 없어서(로그인은 화면만 있는 상태) 안내 메시지만 보여줌
+  const msg = isFindId
+    ? `${email}로 가입된 아이디 정보를 보내드렸어요. 메일함을 확인해주세요.`
+    : `${email}로 비밀번호 재설정 링크를 보내드렸어요. 메일함을 확인해주세요.`;
+  this.setState({ authFindMessage: msg });
+};
+App.renderYearMonthModal = function(t) {
+  const s = this.state;
+  const years = [];
+  for (let y = s.draftYear - 6; y <= s.draftYear + 6; y++) years.push(y);
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:55, padding:20 })}" onclick="App.closeYearMonthPicker()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:300, background:t.surface, borderRadius:20, padding:'18px 18px 20px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ fontSize:16, fontWeight:800, marginBottom:14, textAlign:'center', fontFamily:"'Jua',sans-serif" })}">년/월 선택</div>
+        <div style="${this.styleStr({ display:'flex', gap:10, marginBottom:18 })}">
+          <select style="${this.styleStr({ flex:1, padding:'12px 8px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:16, textAlign:'center' })}" onchange="App.state.draftYear=Number(this.value)">
+            ${years.map(y => `<option value="${y}" ${y===s.draftYear?'selected':''}>${y}년</option>`).join('')}
+          </select>
+          <select style="${this.styleStr({ flex:1, padding:'12px 8px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:16, textAlign:'center' })}" onchange="App.state.draftMonth=Number(this.value)">
+            ${Array.from({length:12}, (_,i)=>i+1).map(m => `<option value="${m}" ${m===s.draftMonth?'selected':''}>${m}월</option>`).join('')}
+          </select>
+        </div>
+        <div style="${this.styleStr({ display:'flex', gap:10 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeYearMonthPicker()">취소</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.confirmYearMonthPicker()">이동</div>
+        </div>
+      </div>
+    </div>
+  `;
+};
+
+App.openYearMonthPicker = function() {
+  this.setState({ yearMonthModalOpen:true, draftYear:this.state.viewYear, draftMonth:this.state.viewMonth + 1 });
+};
+App.closeYearMonthPicker = function() { this.setState({ yearMonthModalOpen:false }); };
+App.confirmYearMonthPicker = function() {
+  this.setState({ viewYear:this.state.draftYear, viewMonth:this.state.draftMonth - 1, yearMonthModalOpen:false });
+};
+
+App.prevMonth = function() { this.setState(s => { let m=s.viewMonth-1,y=s.viewYear; if(m<0){m=11;y--;} return {viewMonth:m, viewYear:y}; }); };
+App.nextMonth = function() { this.setState(s => { let m=s.viewMonth+1,y=s.viewYear; if(m>11){m=0;y++;} return {viewMonth:m, viewYear:y}; }); };
+
+App.openAddModal = function() {
+  this.setState({ modalOpen:true, modalMode:'add', form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', alarm:true, notify:true, priority:'medium' } });
+};
+App.openEditModal = function(id) {
+  const ev = this.state.events.find(e => e._id === id);
+  if (!ev) return;
+  this.setState({ modalOpen:true, modalMode:'edit', form:{ id: ev._id, title: ev.title, startDate: ev.startDate, endDate: ev.endDate, start: ev.start, end: ev.end, alarm: ev.alarm, notify: ev.notify, priority: ev.priority } });
+};
+App.closeModal = function() { this.setState({ modalOpen:false }); };
+
+App.openTodoModal = function() { this.setState({ todoModalOpen:true, todoDraftTitle:'' }); };
+App.closeTodoModal = function() { this.setState({ todoModalOpen:false }); };
+App.saveManualTodo = async function() {
+  const title = this.state.todoDraftTitle.trim();
+  if (!title) return;
+  try {
+    await fetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.todoDate }) });
+    await this.reloadAll();
+    this.setState({ todoModalOpen:false, todoDraftTitle:'' });
+  } catch (err) {
+    alert('할일 저장 실패: ' + err.message);
+  }
+};
+
+App.saveEvent = async function() {
+  const f = this.state.form;
+  if (!f.title.trim()) return;
+  const endDate = f.endDate < f.startDate ? f.startDate : f.endDate;
+  const payload = { title:f.title, startDate:f.startDate, endDate, start:f.start, end:f.end, alarm:f.alarm, notify:f.notify, priority:f.priority };
+  try {
+    if (this.state.modalMode === 'edit') {
+      await fetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    } else {
+      await fetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    }
+    await this.reloadAll();
+    this.setState({ modalOpen:false, selectedDate: f.startDate });
+    if (this.state.modalMode !== 'edit') {
+      this.showToast(`"${f.title}" 일정이 등록됐어요!`);
+      this.scheduleTestAlarm({ title: f.title });
+    }
+  } catch (err) {
+    alert('일정 저장 실패: ' + err.message);
+  }
+};
+App.deleteEvent = async function() {
+  const f = this.state.form;
+  try {
+    await fetch(`${API_BASE}/schedule/${f.id}`, { method:'DELETE' });
+    await this.reloadAll();
+    this.setState({ modalOpen:false });
+  } catch (err) {
+    alert('일정 삭제 실패: ' + err.message);
+  }
+};
+
+App.toggleTodo = async function(id) {
+  await fetch(`${API_BASE}/todos/${id}`, { method:'PATCH' });
+  await this.reloadAll();
+  this.render();
+};
+
+App.openDetail = function(id) { this.setState({ detailEventId:id, showDetailSource:false }); };
+App.closeDetail = function() { this.setState({ detailEventId:null }); };
+App.toggleDetailSource = function() { this.setState(s => ({ showDetailSource: !s.showDetailSource })); };
+
+App.fillSample = function() { this.setState({ noticeText: SAMPLE_NOTICE, imageFile:null, imagePreviewUrl:null, parsedResult:null, addedEvent:false, addedTodo:false, analyzeError:null }); };
+
+App.onImageSelected = function(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (ev) => {
+    this.setState({ imageFile:file, imagePreviewUrl: ev.target.result, noticeText:'', parsedResult:null, addedEvent:false, addedTodo:false, analyzeError:null });
+  };
+  reader.readAsDataURL(file);
+};
+
+App.analyze = async function() {
+  if (this.state.analyzing) return;
+  if (!this.state.noticeText.trim() && !this.state.imageFile) return;
+  this.setState({ analyzing:true, parsedResult:null, analyzeError:null, addedEvent:false, addedTodo:false });
+  try {
+    let res;
+    if (this.state.imageFile) {
+      const formData = new FormData();
+      formData.append('image', this.state.imageFile);
+      res = await fetch(`${API_BASE}/notices/analyze-image`, { method:'POST', body: formData });
+    } else {
+      res = await fetch(`${API_BASE}/notices/analyze-text`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: this.state.noticeText.trim() }) });
+    }
+    if (!res.ok) throw new Error((await res.json()).error || '분석 실패');
+    const data = await res.json();
+    this.setState({ analyzing:false, parsedResult:data });
+  } catch (err) {
+    this.setState({ analyzing:false, analyzeError: err.message });
+  }
+};
+
+App.addParsedEvent = async function() {
+  const p = this.state.parsedResult;
+  if (!p || !p.result.event || this.state.addedEvent) return;
+  try {
+    await fetch(`${API_BASE}/notices/confirm`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addEvent:p.result.event }),
+    });
+    await this.reloadAll();
+    this.setState({ addedEvent:true });
+    this.showToast(`"${p.result.event.title}" 일정이 등록됐어요!`);
+    this.scheduleTestAlarm(p.result.event);
+    this.checkAnalysisComplete();
+  } catch (err) { alert('저장 실패: ' + err.message); }
+};
+App.addParsedTodo = async function() {
+  const p = this.state.parsedResult;
+  if (!p || !p.result.todo || this.state.addedTodo) return;
+  try {
+    await fetch(`${API_BASE}/notices/confirm`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addTodo:p.result.todo }),
+    });
+    await this.reloadAll();
+    this.setState({ addedTodo:true });
+    this.checkAnalysisComplete();
+  } catch (err) { alert('저장 실패: ' + err.message); }
+};
+// 필요한 항목(일정/할일)이 있으면 그게 다 추가됐는지 확인하고, 다 됐으면 분석 카드를 비워서
+// 사용자가 바로 다음 공지를 입력할 수 있게 함
+App.checkAnalysisComplete = function() {
+  const p = this.state.parsedResult;
+  if (!p) return;
+  const eventDone = !p.result.event || this.state.addedEvent;
+  const todoDone = !p.result.todo || this.state.addedTodo;
+  if (eventDone && todoDone) {
+    setTimeout(() => {
+      this.setState({ parsedResult:null, noticeText:'', imageFile:null, imagePreviewUrl:null, addedEvent:false, addedTodo:false });
+    }, 900); // "추가됨" 표시를 잠깐 보여준 뒤 비움
+  }
+};
+
+App.ONBOARDING_SLIDES = [
+  {
+    title: '홈 화면에 추가하고\n앱처럼 써보세요',
+    body: '브라우저 주소창 없이, 진짜 앱처럼 열려요.',
+    steps: [
+      { icon: 'share', text: '하단(또는 상단) 공유 버튼을 탭하세요' },
+      { icon: 'plus', text: '"홈 화면에 추가"를 선택하세요' },
+      { icon: 'check', text: '오른쪽 위 "추가"를 누르면 끝!' },
+    ],
+  },
+  {
+    title: '카톡 공지, 단축어로\n한 번에 넘기기',
+    body: '카카오톡에서 공지를 공유할 때 "신박한 캘린더"로 바로 보낼 수 있게, 아이폰 단축어를 하나 만들어두면 편해요. (자세한 단계별 설명은 공지 탭 우측 상단 "사용 설정"에서 볼 수 있어요)',
+    steps: [
+      { icon: 'shortcut', text: '단축어 앱 → + → 세부사항에서 "공유 시트에서 보기" 켜기' },
+      { icon: 'text', text: '"URL의 콘텐츠 가져오기" 동작 추가, 메소드는 POST' },
+      { icon: 'link', text: '본문(JSON)에 키 "text", 값은 공유 시트 입력 변수로 설정' },
+    ],
+    codeHint: `${window.location.origin}/api/notices/quick-add`,
+  },
+];
+
+App.renderOnboarding = function(t) {
+  const s = this.state;
+  const idx = s.onboardingStep;
+  const slide = this.ONBOARDING_SLIDES[idx];
+  const isLast = idx === this.ONBOARDING_SLIDES.length - 1;
+
+  const iconSvg = (name) => {
+    const common = 'width="20" height="20" viewBox="0 0 24 24" fill="none"';
+    if (name === 'share') return `<svg ${common}><path d="M12 3v12M8 7l4-4 4 4M5 12v6a2 2 0 002 2h10a2 2 0 002-2v-6" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    if (name === 'plus') return `<svg ${common}><rect x="3" y="3" width="18" height="18" rx="4" stroke="#fff" stroke-width="2"/><path d="M12 8v8M8 12h8" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>`;
+    if (name === 'check') return `<svg ${common}><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    if (name === 'shortcut') return `<svg ${common}><rect x="3" y="3" width="18" height="18" rx="5" stroke="#fff" stroke-width="2"/><path d="M8 12h8M8 8h5M8 16h5" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>`;
+    if (name === 'text') return `<svg ${common}><path d="M4 6h16M4 12h16M4 18h10" stroke="#fff" stroke-width="2" stroke-linecap="round"/></svg>`;
+    if (name === 'link') return `<svg ${common}><path d="M9 15l6-6M10 6l1-1a4 4 0 015.7 5.7l-1.4 1.4M14 18l-1 1a4 4 0 01-5.7-5.7l1.4-1.4" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
+    return '';
+  };
+
+  const stepsHtml = slide.steps.map((st, i) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'flex-start', gap:12, marginBottom:14 })}">
+      <div style="${this.styleStr({ width:30, height:30, borderRadius:15, background:'rgba(255,255,255,0.16)', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 })}">${iconSvg(st.icon)}</div>
+      <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:'rgba(255,255,255,0.92)', paddingTop:4 })}">${this.esc(st.text)}</div>
+    </div>
+  `).join('');
+
+  const codeHint = slide.codeHint ? `
+    <div style="${this.styleStr({ background:'rgba(255,255,255,0.12)', borderRadius:10, padding:'10px 12px', fontSize:11.5, color:'#fff', wordBreak:'break-all', marginTop:6, marginBottom:4, fontFamily:'monospace' })}">${this.esc(slide.codeHint)}</div>
+  ` : '';
+
+  const dots = this.ONBOARDING_SLIDES.map((_, i) => `
+    <div style="${this.styleStr({ width: i===idx?18:6, height:6, borderRadius:3, background: i===idx?'#fff':'rgba(255,255,255,0.35)', transition:'width .2s' })}"></div>
+  `).join('');
+
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'linear-gradient(160deg, #3B4177, #262B54)', zIndex:100, display:'flex', flexDirection:'column', padding:'40px 26px 28px', color:'#fff' })}">
+      <div style="${this.styleStr({ textAlign:'right', marginBottom:6 })}">
+        <span style="${this.styleStr({ fontSize:12.5, color:'rgba(255,255,255,0.7)', cursor:'pointer' })}" onclick="App.skipOnboarding()">건너뛰기</span>
+      </div>
+      <div style="${this.styleStr({ flex:1, display:'flex', flexDirection:'column', justifyContent:'center' })}">
+        <div style="${this.styleStr({ fontSize:21, fontWeight:800, lineHeight:1.35, whiteSpace:'pre-line', marginBottom:10 })}">${this.esc(slide.title)}</div>
+        <div style="${this.styleStr({ fontSize:13, color:'rgba(255,255,255,0.75)', lineHeight:1.5, marginBottom:22 })}">${this.esc(slide.body)}</div>
+        ${stepsHtml}
+        ${codeHint}
+      </div>
+      <div style="${this.styleStr({ display:'flex', justifyContent:'center', gap:6, marginBottom:18 })}">${dots}</div>
+      <div style="${this.styleStr({ padding:15, borderRadius:14, background:'#fff', color:'#3B4177', fontWeight:800, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.nextOnboarding()">${isLast ? '시작하기' : '다음'}</div>
+    </div>
+  `;
+};
+
+App.renderToast = function(t) {
+  const s = this.state;
+  return `
+    <div style="${this.styleStr({ position:'absolute', left:16, right:16, bottom:'calc(78px + env(safe-area-inset-bottom))', zIndex:200, display:'flex', justifyContent:'center', pointerEvents:'none' })}">
+      <div style="${this.styleStr({ background: s.dark ? '#2C2E3E' : '#1B1D2A', color:'#fff', padding:'12px 18px', borderRadius:14, fontSize:13.5, fontWeight:700, boxShadow:'0 6px 20px rgba(0,0,0,0.3)', maxWidth:'90%', textAlign:'center' })}">${this.esc(s.toastMessage)}</div>
+    </div>
+  `;
+};
+
+// ---------- 알림/알람 (테스트용) ----------
+// 실제 서비스면 서버가 예약 발송을 하겠지만, 지금은 데모/테스트 목적이라
+// 화면에 떠있는 동안 브라우저에서 직접 타이머로 알려주는 방식으로 구현함
+App.requestNotifyPermission = function() {
+  if (typeof Notification !== 'undefined' && Notification.permission === 'default') {
+    Notification.requestPermission().catch(() => {});
+  }
+};
+
+// VAPID 공개키(base64url 문자열)를 PushManager가 원하는 Uint8Array 형태로 변환
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const rawData = atob(base64);
+  const outputArray = new Uint8Array(rawData.length);
+  for (let i = 0; i < rawData.length; i++) outputArray[i] = rawData.charCodeAt(i);
+  return outputArray;
+}
+
+// 진짜 웹 푸시 구독: 서비스워커 등록 → 알림 권한 요청 → 구독 생성 → 서버에 저장
+// 버튼 클릭(사용자 제스처) 안에서 호출해야 iOS에서도 확실히 동작함
+App.enablePushNotifications = async function() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    this.showToast('이 브라우저는 푸시 알림을 지원하지 않아요.');
+    return;
+  }
+  try {
+    const permission = await Notification.requestPermission();
+    if (permission !== 'granted') {
+      this.showToast('알림 권한을 허용해야 푸시를 받을 수 있어요.');
+      return;
+    }
+
+    const reg = await navigator.serviceWorker.register('/service-worker.js');
+    await navigator.serviceWorker.ready;
+
+    const { publicKey } = await fetch(`${API_BASE}/push/vapid-public-key`).then(r => r.json());
+    if (!publicKey) {
+      this.showToast('서버에 VAPID 키가 설정 안 돼있어요.');
+      return;
+    }
+
+    let sub = await reg.pushManager.getSubscription();
+    if (!sub) {
+      sub = await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(publicKey),
+      });
+    }
+
+    await fetch(`${API_BASE}/push/subscribe`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(sub.toJSON()),
+    });
+
+    this.setState({ pushEnabled: true });
+    this.showToast('푸시 알림이 켜졌어요! 🔔');
+  } catch (err) {
+    console.error(err);
+    this.showToast('푸시 설정 실패: ' + err.message);
+  }
+};
+
+// 앱 시작할 때 이미 구독돼있는지 조용히 확인만 함 (버튼 상태 표시용)
+App.checkPushEnabled = async function() {
+  try {
+    if (!('serviceWorker' in navigator)) return;
+    const reg = await navigator.serviceWorker.getRegistration();
+    if (!reg) return;
+    const sub = await reg.pushManager.getSubscription();
+    if (sub) this.setState({ pushEnabled: true });
+  } catch (e) { /* 조용히 무시 */ }
+};
+
+App.showToast = function(message) {
+  this.setState({ toastMessage: message });
+  // 브라우저 알림 권한이 있으면 실제 알림도 같이 띄움 (앱이 백그라운드여도 보임)
+  try {
+    if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+      new Notification('신박한 캘린더', { body: message });
+    }
+  } catch (e) { /* 알림 API 미지원 브라우저는 무시 */ }
+  clearTimeout(this._toastTimer);
+  this._toastTimer = setTimeout(() => { this.setState({ toastMessage: null }); }, 3000);
+};
+// 일정 등록 1분 뒤 "테스트용" 알람을 울려줌 (실제 시작 시간이 아니라 등록 시점 기준 1분 후)
+App.scheduleTestAlarm = function(event) {
+  setTimeout(() => {
+    this.showToast(`⏰ [테스트 알람] "${event.title}" 일정 알림이에요!`);
+  }, 60 * 1000);
+};
+
+App.nextOnboarding = function() {
+  if (this.state.onboardingStep < this.ONBOARDING_SLIDES.length - 1) {
+    this.setState(s => ({ onboardingStep: s.onboardingStep + 1 }));
+  } else {
+    this.closeOnboarding();
+  }
+};
+App.skipOnboarding = function() { this.closeOnboarding(); };
+App.closeOnboarding = function() {
+  localStorage.setItem('sc_onboarding_done', '1');
+  this.setState({ showOnboarding: false, onboardingStep: 0 });
+};
+
+window.App = App;
+App.init();
+</script>
+</body>
+</html>
