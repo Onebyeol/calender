@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: sinbak-calendar
+    runtime: node
+    plan: free
+    rootDir: smart-calendar
+    buildCommand: cd backend && npm ci
+    startCommand: cd backend && npm start
+    healthCheckPath: /health
+    autoDeployTrigger: off
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_MODEL
+        value: gemini-3.1-flash-lite,gemini-3.1-flash,gemini-2.5-flash

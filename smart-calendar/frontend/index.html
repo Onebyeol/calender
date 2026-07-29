@@ -245,10 +245,21 @@ const App = {
   },
 
   async init() {
+    // PWA 설치 및 Android Web Share Target 등록을 위해 서비스워커를 항상 등록한다.
+    // 푸시 알림 권한 요청은 사용자가 알림 버튼을 누를 때 별도로 진행된다.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/service-worker.js')
+        .catch(err => console.warn('서비스워커 등록 실패:', err));
+    }
+
     // 아이폰 "단축어"에서 공유 시트로 텍스트를 보내면
-    // ?tab=notice&text=... 형태로 열리도록 되어있음 → 공지 탭에 자동으로 채워줌
+    // Android Web Share Target 또는 ?text= 링크로 전달된 내용을 공지 탭에 자동으로 채워줌
     const params = new URLSearchParams(location.search);
-    const sharedText = params.get('text');
+    const sharedText = [...new Set(
+      [params.get('title'), params.get('text'), params.get('url')]
+        .map(value => (value || '').trim())
+        .filter(Boolean)
+    )].join('\n\n');
     if (sharedText) {
       this.state.tab = 'notice';
       this.state.noticeText = sharedText;
