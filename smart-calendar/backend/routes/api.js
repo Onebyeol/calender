@@ -43,7 +43,11 @@ const router = express.Router();
 // 이미지는 메모리에만 잠깐 올렸다가 base64로 바로 Gemini에 넘기고 버림 (디스크 저장 안 함)
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 8 * 1024 * 1024 }, // 8MB
+  limits: {
+    fileSize: 8 * 1024 * 1024, // 파일당 8MB
+    files: 4,
+    fields: 10,
+  },
 });
 
 // 일정이 하나 생성될 때마다 호출: 즉시 등록 알림 1번 + (테스트용) 1분 뒤 알람 1번을 푸시로 보냄
@@ -663,14 +667,57 @@ function redirectShareError(res, message) {
   return res.redirect(303, `/?${query.toString()}`);
 }
 
-// Share Target의 multipart 폼/이미지를 파싱하고, 용량 오류도 앱 화면으로 돌려보낸다.
+function detectSharedImageMime(file) {
+  const declared = String(file?.mimetype || '').toLowerCase();
+  if (declared.startsWith('image/')) return declared;
+
+  const buffer = file?.buffer;
+  if (buffer?.length >= 12) {
+    if (buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
+    if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'image/jpeg';
+    if (buffer.subarray(0, 3).toString('ascii') === 'GIF') return 'image/gif';
+    if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'image/webp';
+    if (buffer.subarray(4, 12).toString('ascii').startsWith('ftyphei')) return 'image/heic';
+  }
+
+  const extension = String(file?.originalname || '').split('.').pop().toLowerCase();
+  return {
+    png: 'image/png',
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    gif: 'image/gif',
+    webp: 'image/webp',
+    heic: 'image/heic',
+    heif: 'image/heif',
+  }[extension] || null;
+}
+
+// Android 제조사/공유 앱마다 파일 필드명과 단일·배열 전송 방식이 달라서 any()로 받은 뒤
+// 실제 이미지 첫 장을 골라낸다. 용량·파일 수 제한은 위 upload 설정을 그대로 적용한다.
 function receiveSharedImage(req, res, next) {
-  upload.single('image')(req, res, (err) => {
-    if (!err) return next();
-    const message = err.code === 'LIMIT_FILE_SIZE'
-      ? '이미지는 8MB 이하만 공유할 수 있어요.'
-      : '공유한 이미지를 읽지 못했어요.';
-    return redirectShareError(res, message);
+  upload.any()(req, res, (err) => {
+    if (err) {
+      console.error('[share upload]', err.code || 'UPLOAD_ERROR', err.field || '', err.message);
+      const message = err.code === 'LIMIT_FILE_SIZE'
+        ? '이미지는 8MB 이하만 공유할 수 있어요.'
+        : err.code === 'LIMIT_FILE_COUNT'
+          ? '한 번에 공유한 이미지가 너무 많아요.'
+          : '공유한 이미지를 읽지 못했어요.';
+      return redirectShareError(res, message);
+    }
+
+    const files = Array.isArray(req.files) ? req.files : [];
+    req.file = files.find((file) => {
+      const mime = detectSharedImageMime(file);
+      if (!mime) return false;
+      file.mimetype = mime;
+      return true;
+    }) || null;
+
+    if (files.length && !req.file) {
+      return redirectShareError(res, '지원하지 않는 이미지 형식이에요. PNG 또는 JPG로 다시 시도해주세요.');
+    }
+    return next();
   });
 }
 
