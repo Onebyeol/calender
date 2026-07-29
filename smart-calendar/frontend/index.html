@@ -252,9 +252,11 @@ const App = {
         .catch(err => console.warn('서비스워커 등록 실패:', err));
     }
 
-    // 아이폰 "단축어"에서 공유 시트로 텍스트를 보내면
-    // Android Web Share Target 또는 ?text= 링크로 전달된 내용을 공지 탭에 자동으로 채워줌
+    // ?text= 링크는 확인 화면에 채우고, Android POST Share Target은 서버가 자동 등록한 뒤
+    // shareStatus/shareMessage를 붙여 이 화면으로 돌려보낸다.
     const params = new URLSearchParams(location.search);
+    const shareStatus = params.get('shareStatus');
+    const shareMessage = params.get('shareMessage');
     const sharedText = [...new Set(
       [params.get('title'), params.get('text'), params.get('url')]
         .map(value => (value || '').trim())
@@ -263,7 +265,17 @@ const App = {
     if (sharedText) {
       this.state.tab = 'notice';
       this.state.noticeText = sharedText;
-      history.replaceState(null, '', location.pathname); // 주소창에서 파라미터 지움
+    }
+    if (shareStatus) {
+      this.state.tab = shareStatus === 'success' ? 'calendar' : 'notice';
+      this.state.toastMessage = shareMessage || (shareStatus === 'success'
+        ? '공유한 공지를 자동으로 등록했어요!'
+        : '공유한 공지를 자동 등록하지 못했어요.');
+      // 공유로 들어왔을 때 설치 안내가 결과를 가리지 않도록 최초 안내를 완료 처리한다.
+      localStorage.setItem('sc_onboarding_done', '1');
+    }
+    if (sharedText || shareStatus) {
+      history.replaceState(null, '', location.pathname); // 새로고침 시 재처리되지 않게 파라미터 제거
     }
 
     // 최초 1회만 사용 안내 가이드 표시
@@ -277,6 +289,12 @@ const App = {
     await this.reloadAll();
     this.state.loading = false;
     this.render();
+    if (shareStatus) {
+      clearTimeout(this._toastTimer);
+      this._toastTimer = setTimeout(() => {
+        this.setState({ toastMessage: null });
+      }, 6000);
+    }
   },
 
   async reloadAll() {

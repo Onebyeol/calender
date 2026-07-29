@@ -568,9 +568,67 @@ router.get('/briefing', async (req, res) => {
   }
 });
 
-// ---------- 단축어 자동화 전용: 분석 + 저장을 한 번에 (앱 화면 없이 백그라운드 처리) ----------
-// 아이폰 "단축어" 앱에서 공유 시트로 텍스트를 받아 이 엔드포인트에 바로 POST하면,
-// 사용자가 앱을 열 필요 없이 AI가 알아서 일정/할일까지 저장해줌.
+// ---------- 공유/단축어 자동화: 분석 + 저장을 한 번에 ----------
+// Android Web Share Target과 iOS 단축어가 같은 저장 로직을 공유한다.
+async function quickAddNotice(text, categories) {
+  // 공유 시트는 종류 설정을 못 보내므로 기본 6종으로 처리된다.
+  const ctx = categoryContext(categories);
+  const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
+  parsed.category = ctx.toKey(parsed.category);
+  const shaped = shapeParsed(parsed, ctx);
+
+  const notice = await Notice.create({
+    sourceType: 'text',
+    rawContent,
+    summary: shaped.summary,
+    priority: shaped.priority,
+    category: shaped.category,
+    needsPrep: shaped.needsPrep,
+    leadTimeDays: shaped.leadTimeDays,
+  });
+
+  let savedEvent = null;
+  let savedTodo = null;
+
+  if (shaped.event) {
+    // shapeParsed()에서 이미 준비기간이 반영된 상태(startDate 당겨짐 + steps 생성)라 그대로 저장
+    savedEvent = await ScheduleEvent.create({
+      noticeId: notice._id,
+      ...shaped.event,
+      category: shaped.category,
+      alarm: true,
+      notify: true,
+      priority: shaped.priority,
+      aiSummary: shaped.summary,
+      sourceType: 'text',
+      sourceContent: rawContent,
+    });
+    notifyEventCreated(savedEvent);
+  }
+  if (shaped.todo) {
+    savedTodo = await Todo.create({
+      noticeId: notice._id,
+      title: shaped.todo.title,
+      due: shaped.todo.due,
+      done: false,
+    });
+  }
+
+  let message;
+  if (savedEvent && savedEvent.needsPrep) {
+    message = `"${savedEvent.title}" — ${savedEvent.startDate}부터 준비 시작 (마감 ${savedEvent.endDate}, 준비 ${savedEvent.leadTimeDays}일)`;
+  } else if (savedEvent) {
+    message = `"${savedEvent.title}" 일정이 추가됐어요.`;
+  } else if (savedTodo) {
+    message = `"${savedTodo.title}" 할일이 추가됐어요.`;
+  } else {
+    message = '분석은 했지만 캘린더에 추가할 일정/할일은 없었어요.';
+  }
+
+  return { message, notice, event: savedEvent, todo: savedTodo };
+}
+
+// 아이폰 단축어용 JSON API
 router.post('/notices/quick-add', async (req, res) => {
   try {
     const { text } = req.body;
@@ -578,65 +636,45 @@ router.post('/notices/quick-add', async (req, res) => {
       return res.status(400).json({ error: '공지 텍스트가 비어있음' });
     }
 
-    // 단축어는 종류 설정을 못 보내므로 기본 6종으로 처리된다
-    const ctx = categoryContext(req.body.categories);
-    const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
-    parsed.category = ctx.toKey(parsed.category);
-    const shaped = shapeParsed(parsed, ctx);
-
-    const notice = await Notice.create({
-      sourceType: 'text',
-      rawContent,
-      summary: shaped.summary,
-      priority: shaped.priority,
-      category: shaped.category,
-      needsPrep: shaped.needsPrep,
-      leadTimeDays: shaped.leadTimeDays,
-    });
-
-    let savedEvent = null;
-    let savedTodo = null;
-
-    if (shaped.event) {
-      // shapeParsed()에서 이미 준비기간이 반영된 상태(startDate 당겨짐 + steps 생성)라 그대로 저장
-      savedEvent = await ScheduleEvent.create({
-        noticeId: notice._id,
-        ...shaped.event,
-        category: shaped.category,
-        alarm: true,
-        notify: true,
-        priority: shaped.priority,
-        aiSummary: shaped.summary,
-        sourceType: 'text',
-        sourceContent: rawContent,
-      });
-      notifyEventCreated(savedEvent);
-    }
-    if (shaped.todo) {
-      savedTodo = await Todo.create({
-        noticeId: notice._id,
-        title: shaped.todo.title,
-        due: shaped.todo.due,
-        done: false,
-      });
-    }
-
-    // 단축어의 "알림 표시" 동작에서 바로 쓰기 좋게 사람이 읽을 수 있는 메시지도 같이 반환
-    let message;
-    if (savedEvent && savedEvent.needsPrep) {
-      message = `"${savedEvent.title}" — ${savedEvent.startDate}부터 준비 시작 (마감 ${savedEvent.endDate}, 준비 ${savedEvent.leadTimeDays}일)`;
-    } else if (savedEvent) {
-      message = `"${savedEvent.title}" 일정이 추가됐어요.`;
-    } else if (savedTodo) {
-      message = `"${savedTodo.title}" 할일이 추가됐어요.`;
-    } else {
-      message = '분석은 했지만 캘린더에 추가할 일정/할일은 없었어요.';
-    }
-
-    res.status(201).json({ message, notice, event: savedEvent, todo: savedTodo });
+    const result = await quickAddNotice(text, req.body.categories);
+    res.status(201).json(result);
   } catch (err) {
     console.error('[POST /notices/quick-add]', err);
     res.status(500).json({ error: '자동 처리 중 오류 발생', detail: err.message });
+  }
+});
+
+// Android PWA 공유 대상: 폼으로 전달된 내용을 곧바로 AI 분석·저장하고 앱으로 돌아간다.
+router.post('/notices/share-target', async (req, res) => {
+  const body = req.body || {};
+  const sharedText = [...new Set(
+    [body.title, body.text, body.url]
+      .map((value) => String(value || '').trim())
+      .filter(Boolean)
+  )].join('\n\n');
+
+  if (!sharedText) {
+    const query = new URLSearchParams({
+      shareStatus: 'error',
+      shareMessage: '공유된 텍스트가 비어 있어 등록하지 못했어요.',
+    });
+    return res.redirect(303, `/?${query.toString()}`);
+  }
+
+  try {
+    const result = await quickAddNotice(sharedText);
+    const query = new URLSearchParams({
+      shareStatus: 'success',
+      shareMessage: result.message,
+    });
+    return res.redirect(303, `/?${query.toString()}`);
+  } catch (err) {
+    console.error('[POST /notices/share-target]', err);
+    const query = new URLSearchParams({
+      shareStatus: 'error',
+      shareMessage: 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.',
+    });
+    return res.redirect(303, `/?${query.toString()}`);
   }
 });
 

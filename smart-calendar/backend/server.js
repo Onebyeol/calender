@@ -9,6 +9,8 @@ const apiRouter = require('./routes/api');
 const app = express();
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
+// Android Web Share Target의 POST 폼(application/x-www-form-urlencoded) 수신
+app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 
 // 프론트엔드 정적 파일 서빙 (배포 시 별도 프론트 호스팅 없이 이 서버 하나로 시연 가능)
 app.use(express.static(path.join(__dirname, '..', 'frontend')));
