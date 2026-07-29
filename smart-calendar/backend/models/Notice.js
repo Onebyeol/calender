@@ -29,6 +29,16 @@ const noticeSchema = new mongoose.Schema(
       type: String,
       default: '기타',
     },
+    // AI가 "준비가 필요한 유형"이라고 판단했는지 (기획서 8.3)
+    needsPrep: {
+      type: Boolean,
+      default: false,
+    },
+    // 이 공지에 최종 적용된 준비기간(일)
+    leadTimeDays: {
+      type: Number,
+      default: 0,
+    },
     aiRaw: {
       // AI가 반환한 원본 JSON을 그대로 보관 (디버깅/재처리용)
       type: mongoose.Schema.Types.Mixed,

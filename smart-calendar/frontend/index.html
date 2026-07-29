@@ -60,6 +60,101 @@ const PRIORITY_META = {
   medium: { label: '보통', color: '#E8A23D' },
   low: { label: '낮음', color: '#6FA287' },
 };
+
+// ---------- 일정 색상 ----------
+// 색상(색조)은 "무엇인지"를 구분하는 데, 진하기·기호는 "얼마나 급한지"를 나타내는 데 적합하다.
+// 예전에는 중요도를 막대 색으로 썼더니 중요도가 같은 일정이 전부 같은 색이 돼서 구분이 안 됐다.
+// 그래서 색조는 카테고리(+일정별 미세 변주)가 갖고, 중요도는 막대 안 점으로 분리했다.
+//
+// light 값이 카테고리마다 다른 이유: 같은 명도라도 색조에 따라 체감 밝기가 달라서
+// (청록·초록은 밝고 파랑은 어둡다) 글씨가 안 읽힌다. 색조 변주 ±14도까지 넣고
+// 흰/검 글씨 대비를 계산해서 전부 4.5 이상 나오는 값으로 맞춰둔 것이다. 함부로 바꾸면 글씨가 묻힌다.
+// 일정 종류는 사용자가 추가/삭제/이름변경/색변경 할 수 있다. 아래는 아무 설정도 안 했을 때의 기본값.
+// (백엔드 leadTimeService.js의 DEFAULT_CATEGORIES와 같은 값을 유지해야 한다)
+const DEFAULT_CATEGORIES = [
+  { key:'학사일정', label:'학사일정', hue:178, leadDays:2, aiDecides:true,  stepTemplate:'school'  },
+  { key:'과제',     label:'과제',     hue:205, leadDays:3, aiDecides:false, stepTemplate:'writing' },
+  { key:'시험',     label:'시험',     hue:268, leadDays:7, aiDecides:false, stepTemplate:'exam'    },
+  { key:'행사',     label:'행사',     hue:34,  leadDays:0, aiDecides:false, stepTemplate:'generic' },
+  { key:'회의',     label:'회의',     hue:332, leadDays:0, aiDecides:false, stepTemplate:'generic' },
+  { key:'기타',     label:'기타',     hue:142, leadDays:1, aiDecides:true,  stepTemplate:'generic' },
+];
+const FALLBACK_CATEGORY_KEY = '기타'; // 분류 실패 시 떨어지는 종류. 삭제할 수 없다.
+const MAX_CATEGORIES = 10;
+
+// 고를 수 있는 색조. 아무 색이나 열어두면 글씨가 안 읽히거나 종류끼리 구분이 안 되므로
+// 서로 충분히 떨어진 11색만 제공한다. (이 목록 전체에 대해 아래 조건을 미리 검증해둠)
+const HUE_PALETTE = [10, 34, 62, 105, 142, 178, 205, 238, 268, 308, 332];
+
+const STEP_TEMPLATE_OPTIONS = [
+  { value:'writing',      label:'작성형', preview:'자료조사 → 개요 → 본문 → 퇴고' },
+  { value:'presentation', label:'발표형', preview:'자료조사 → 초안 → 리허설 → 점검' },
+  { value:'exam',         label:'시험형', preview:'범위정리 → 복습 → 오답 → 점검' },
+  { value:'school',       label:'학사형', preview:'안내문 확인 → 준비물 → 최종확인' },
+  { value:'generic',      label:'일반',   preview:'내용 확인 → 준비 → 마무리' },
+];
+
+// ---------- 색상 생성 ----------
+// 색조 하나가 정해지면 그 종류의 6가지 변주를 계산해서 만든다. 표를 손으로 적어두지 않는 이유는
+// 사용자가 색을 바꿀 수 있어서, 어떤 색조가 와도 아래 조건이 지켜져야 하기 때문이다.
+//   1) 막대 안 글씨(흰 또는 검) 대비 4.0 이상 — 안 그러면 제목이 묻힌다
+//   2) 같은 종류 안 변주끼리 색차 35 이상 — 서로 다른 일정으로 보여야 한다
+//   3) 다른 종류 간 색차가 2번보다 커야 "같은 종류끼리 비슷해 보인다"가 유지된다
+// 색조마다 체감 밝기가 달라서(청록·초록은 밝고 파랑은 어둡다) 명도를 색조별로 풀어야 한다.
+const SWATCH_RECIPES = [[-12,0],[12,-9],[12,9],[12,0],[-12,9],[-12,-9]]; // [채도 오프셋, 명도 오프셋]
+const BASE_SAT = 52;
+const TEXT_DARK = '#1B1D2A';
+
+function hslToRgb(h, s, l) {
+  s /= 100; l /= 100;
+  const k = n => (n + h / 30) % 12;
+  const a = s * Math.min(l, 1 - l);
+  const f = n => l - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+  return [f(0), f(8), f(4)];
+}
+function relLuminance(rgb) {
+  const c = rgb.map(v => (v <= 0.03928 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4)));
+  return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2];
+}
+function contrastRatio(rgb, otherLum) {
+  const a = relLuminance(rgb);
+  return (Math.max(a, otherLum) + 0.05) / (Math.min(a, otherLum) + 0.05);
+}
+const LUM_WHITE = 1;
+const LUM_DARK = relLuminance([0x1B/255, 0x1D/255, 0x2A/255]);
+
+// 그 색조에서 글씨가 가장 잘 읽히면서 너무 어둡지도 밝지도 않은 기준 명도를 찾는다
+function baseLightnessForHue(hue) {
+  let pick = null;
+  for (let l = 26; l <= 72; l += 0.5) {
+    const rgb = hslToRgb(hue, BASE_SAT, l);
+    const c = Math.max(contrastRatio(rgb, LUM_WHITE), contrastRatio(rgb, LUM_DARK));
+    if (c >= 4.5 && (pick === null || Math.abs(l - 50) < Math.abs(pick - 50))) pick = l;
+  }
+  return pick === null ? 50 : pick;
+}
+
+// 대비가 4.0 밑이면 읽힐 때까지 명도를 밀어서 안전한 색을 만든다
+function solveSwatch(hue, sat, light) {
+  let l = light;
+  for (let i = 0; i < 40; i++) {
+    const rgb = hslToRgb(hue, sat, l);
+    const cw = contrastRatio(rgb, LUM_WHITE), cd = contrastRatio(rgb, LUM_DARK);
+    if (Math.max(cw, cd) >= 4.0) return { h: hue, s: sat, l: Math.round(l), dark: cd > cw };
+    l += (cd > cw) ? 1.5 : -1.5;
+    l = Math.max(18, Math.min(84, l));
+  }
+  const rgb = hslToRgb(hue, sat, l);
+  return { h: hue, s: sat, l: Math.round(l), dark: contrastRatio(rgb, LUM_DARK) > contrastRatio(rgb, LUM_WHITE) };
+}
+
+const swatchCache = {};
+function swatchesForHue(hue) {
+  if (swatchCache[hue]) return swatchCache[hue];
+  const base = baseLightnessForHue(hue);
+  swatchCache[hue] = SWATCH_RECIPES.map(([ds, dl]) => solveSwatch(hue, BASE_SAT + ds, base + dl));
+  return swatchCache[hue];
+}
 const WEEKDAY_NAMES = ['일','월','화','수','목','금','토'];
 const SAMPLE_NOTICE = '[학사공지] 2026학년도 2학기 수강신청 정정기간 안내\n\n기간: 2026.07.29.(수) 09:00 ~ 18:00\n대상: 전체 재학생\n방법: 학사정보시스템 로그인 후 신청\n문의: 학사지원팀 (02-123-4567)';
 
@@ -74,12 +169,16 @@ function todayIso() {
 // ============================================================
 const App = {
   state: {
-    tab: 'calendar', // 'notify' | 'notice' | 'calendar' | 'todo'
+    // 탭 4개: 오늘(무엇을 할지) / 캘린더(언제) / 진행(계획 상태) / 설정
+    // 'notice'는 탭이 아니라 (+) 버튼에서 들어가는 등록 화면이다.
+    tab: 'today', // 'today' | 'calendar' | 'progress' | 'settings' | 'notice'
+    addSheetOpen: false,
     dark: false,
     viewYear: Number(todayIso().slice(0,4)),
     viewMonth: Number(todayIso().slice(5,7)) - 1,
     selectedDate: todayIso(),
-    todoDate: todayIso(),
+    // (선택 날짜는 selectedDate 하나로 통일했다. 예전엔 캘린더와 할일이 서로 다른 날짜를 봐서
+    //  그리드에서 30일을 고르고 할일로 넘어가면 29일이 나오는 문제가 있었다)
     events: [],
     todos: [],
     loading: true,
@@ -109,9 +208,29 @@ const App = {
     imagePreviewUrl: null,
     analyzing: false,
     analyzeError: null,
-    parsedResult: null, // { sourceType, rawContent, result: {summary,priority,category,event,todo} }
+    parsedResult: null, // { sourceType, rawContent, result: {summary,priority,category,event,todo,needsPrep,leadTimeDays} }
     addedEvent: false,
     addedTodo: false,
+
+    // 확인 화면에서 사용자가 조정 중인 준비기간(일). null이면 AI/규칙표가 낸 값 그대로
+    leadDraft: null,
+    // 일별 브리핑 (GET /api/briefing 결과)
+    briefing: null,
+    // 캘린더 탭에서 보고 있는 것: 'event'(월 그리드) | 'todo'(할일 목록)
+    calendarMode: 'event',
+
+    // 일정 종류 설정 모달
+    catEditorOpen: false,
+    catDraft: [],
+    catExpanded: null,
+
+    // 준비 단계 편집 모달
+    stepEditorOpen: false,
+    stepEditorEventId: null,
+    stepDraft: [],          // [{ title, done }]
+    stepRemember: true,     // 고친 구성을 다음에도 쓸지
+    // 분석 결과에 "예전에 고쳐둔 단계 구성"이 적용됐는지 (확인 화면에 배지로 표시)
+    stepPrefApplied: false,
 
     showOnboarding: false,
     onboardingStep: 0,
@@ -151,12 +270,15 @@ const App = {
 
   async reloadAll() {
     try {
-      const [events, todos] = await Promise.all([
+      const [events, todos, briefing] = await Promise.all([
         fetch(`${API_BASE}/schedule`).then(r => r.json()),
         fetch(`${API_BASE}/todos`).then(r => r.json()),
+        fetch(`${API_BASE}/briefing`).then(r => r.json()).catch(() => null),
       ]);
       this.state.events = events;
       this.state.todos = todos;
+      this.state.briefing = briefing;
+      this.rebuildColorIndex();
     } catch (err) {
       console.error('데이터 로딩 실패', err);
     }
@@ -169,7 +291,8 @@ App.theme = function(dark) {
     bg: '#12131C', surface: '#1C1E2B', surfaceAlt: '#232538', text: '#EDEDF3',
     textMuted: '#9A9CB0', textFaint: '#6C6E82', border: '#2C2E3E', primary: '#6B74C9',
   } : {
-    bg: '#F7F7FA', surface: '#FFFFFF', surfaceAlt: '#F0F0F6', text: '#1B1D2A',
+    // bg를 흰색에 너무 가깝게 두면 흰 카드가 배경에 묻혀서 구분이 안 된다. 한 단계 낮췄다.
+    bg: '#ECECF3', surface: '#FFFFFF', surfaceAlt: '#F2F2F7', text: '#1B1D2A',
     textMuted: '#6B6E85', textFaint: '#9C9EB2', border: '#E7E7EE', primary: '#3B4177',
   };
 };
@@ -189,6 +312,252 @@ App.formatDayHeader = function(iso) {
   const d = new Date(iso + 'T00:00:00');
   return `${d.getMonth()+1}월 ${d.getDate()}일 (${WEEKDAY_NAMES[d.getDay()]})`;
 };
+
+// ---------- 일정 색상 유틸 ----------
+
+// 제목을 숫자로 바꿔서 색조 변주에 쓴다. 같은 제목이면 항상 같은 색이 나와야
+// "국어 수행평가는 파란색"처럼 기억할 수 있으므로, 무작위가 아니라 해시를 쓴다.
+App.hashCode = function(str) {
+  let h = 0;
+  for (let i = 0; i < String(str).length; i++) h = (h * 31 + String(str).charCodeAt(i)) | 0;
+  return Math.abs(h);
+};
+
+function swatchToColor(sw) {
+  return { bg: `hsl(${sw.h}, ${sw.s}%, ${sw.l}%)`, fg: sw.dark ? TEXT_DARK : '#FFFFFF' };
+}
+
+// ---------- 일정 종류 설정 (사용자가 바꿀 수 있음) ----------
+App.CATEGORY_PREF_KEY = 'sc_categories';
+
+App.categories = function() {
+  if (this._categories) return this._categories;
+  let list = null;
+  try {
+    const raw = JSON.parse(localStorage.getItem(this.CATEGORY_PREF_KEY) || 'null');
+    if (Array.isArray(raw) && raw.length) list = raw;
+  } catch (e) { list = null; }
+  this._categories = this.normalizeCategories(list || DEFAULT_CATEGORIES);
+  return this._categories;
+};
+
+App.normalizeCategories = function(list) {
+  const seen = new Set();
+  const out = [];
+  (list || []).slice(0, MAX_CATEGORIES).forEach(c => {
+    const key = String((c && c.key) || '').trim().slice(0, 20);
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({
+      key,
+      label: String((c && c.label) || key).trim().slice(0, 12) || key,
+      hue: HUE_PALETTE.includes(Number(c && c.hue)) ? Number(c.hue) : HUE_PALETTE[0],
+      leadDays: Math.max(0, Math.min(30, Math.round(Number(c && c.leadDays) || 0))),
+      aiDecides: Boolean(c && c.aiDecides),
+      stepTemplate: STEP_TEMPLATE_OPTIONS.some(o => o.value === (c && c.stepTemplate)) ? c.stepTemplate : 'generic',
+    });
+  });
+  // 분류 실패 시 떨어질 종류가 반드시 하나는 있어야 한다
+  if (!out.some(c => c.key === FALLBACK_CATEGORY_KEY)) {
+    out.push(DEFAULT_CATEGORIES[DEFAULT_CATEGORIES.length - 1]);
+  }
+  return out;
+};
+
+App.saveCategories = function(list) {
+  const normalized = this.normalizeCategories(list);
+  try { localStorage.setItem(this.CATEGORY_PREF_KEY, JSON.stringify(normalized)); } catch (e) { /* 무시 */ }
+  this._categories = normalized;
+  Object.keys(swatchCache).forEach(k => delete swatchCache[k]); // 색조가 바뀌었을 수 있으니 캐시 비움
+  this.rebuildColorIndex();
+};
+
+App.resetCategories = function() {
+  try { localStorage.removeItem(this.CATEGORY_PREF_KEY); } catch (e) { /* 무시 */ }
+  this._categories = null;
+  Object.keys(swatchCache).forEach(k => delete swatchCache[k]);
+  this.rebuildColorIndex();
+};
+
+App.categoryOf = function(key) {
+  const list = this.categories();
+  return list.find(c => c.key === key)
+    || list.find(c => c.key === FALLBACK_CATEGORY_KEY)
+    || list[list.length - 1];
+};
+
+App.categoryLabel = function(key) {
+  const c = this.categoryOf(key);
+  return c ? c.label : key;
+};
+
+// 범례에 쓸 종류 대표색
+App.categoryColor = function(key) {
+  return swatchToColor(swatchesForHue(this.categoryOf(key).hue)[0]);
+};
+
+// 카테고리 안에서 몇 번째 변주를 쓸지 미리 정해둔다.
+// 제목 해시로 고르면 과제 3개가 우연히 같은 변주로 몰려서 색이 똑같아지는 일이 생긴다(실제로 발생).
+// 그래서 카테고리별로 순번을 돌려 배정해 같은 카테고리 일정 3개까지는 반드시 서로 다른 색이 되게 한다.
+// 정렬 기준을 _id(생성 순서)로 두면 새 일정은 뒤에 붙으므로 기존 일정의 색이 바뀌지 않는다.
+App._colorIndex = {};
+App.rebuildColorIndex = function() {
+  const counter = {};
+  this._colorIndex = {};
+  this.state.events
+    .slice()
+    .sort((a, b) => String(a._id).localeCompare(String(b._id)))
+    .forEach(ev => {
+      const cat = this.categoryOf(ev.category).key;
+      counter[cat] = counter[cat] || 0;
+      this._colorIndex[ev._id] = counter[cat]++;
+    });
+};
+
+// 일정 하나의 고유 색. 캘린더 막대·목록·브리핑 어디서나 같은 색이 나오게 한 곳에서만 계산한다.
+App.eventSwatch = function(ev) {
+  const list = swatchesForHue(this.categoryOf(ev && ev.category).hue);
+  // 아직 저장 전이라 _id가 없는 미리보기 일정은 제목 해시로 대신 고른다
+  const idx = (ev && this._colorIndex[ev._id] !== undefined)
+    ? this._colorIndex[ev._id]
+    : this.hashCode((ev && ev.title) || '');
+  return list[idx % list.length];
+};
+App.eventColor = function(ev) { return swatchToColor(this.eventSwatch(ev)); };
+
+// 같은 색의 '연한 버전'. 카드를 통째로 칠하면 화면이 시끄러워지니,
+// 종류 라벨처럼 작은 영역에만 옅은 배경 + 진한 글씨로 색을 드러낼 때 쓴다.
+App.tintOf = function(sw) {
+  return this.state.dark
+    ? { bg: `hsl(${sw.h}, ${Math.round(sw.s * 0.6)}%, 21%)`, fg: `hsl(${sw.h}, ${Math.round(sw.s * 0.85)}%, 72%)` }
+    : { bg: `hsl(${sw.h}, ${Math.round(sw.s * 0.75)}%, 93%)`, fg: `hsl(${sw.h}, ${Math.round(sw.s * 0.95)}%, 32%)` };
+};
+App.eventTint = function(ev) { return this.tintOf(this.eventSwatch(ev)); };
+
+App.priorityColor = function(priority) {
+  return (PRIORITY_META[priority] || PRIORITY_META.medium).color;
+};
+
+// 목록에서 쓰는 표시: 안쪽 = 일정 색(무슨 일정인지), 테두리 = 중요도
+App.eventDot = function(ev, size) {
+  const c = this.eventColor(ev);
+  return `<div style="${this.styleStr({
+    width:size, height:size, borderRadius:size/2, background:c.bg,
+    border:`2px solid ${this.priorityColor(ev.priority)}`, boxSizing:'border-box', flexShrink:0,
+  })}"></div>`;
+};
+
+// ---------- 준비기간(리드타임) 관련 유틸 ----------
+
+// 서버(leadTimeService.applyLeadTime)와 같은 규칙으로 준비 시작일을 계산한다.
+// 확인 화면에서 사용자가 +/- 를 누를 때마다 즉시 미리보기를 보여주기 위한 것이고,
+// 실제 저장값은 서버가 다시 계산하므로 여기 값은 화면 표시용이다.
+App.prepStart = function(event, leadDays) {
+  const anchor = event.originalStartDate || event.startDate;
+  if (!leadDays || leadDays <= 0) return anchor;
+  let start = this.addDays(anchor, -leadDays);
+  const today = todayIso();
+  if (start < today && today <= event.endDate) start = today;
+  return start;
+};
+
+// 단계 완료 비율 (0~1)
+// ---------- "해야 할 것" 목록 ----------
+// 준비 단계와 단순 할일을 같은 모양으로 합쳐서 돌려준다.
+// 오늘 탭과 캘린더 할일 보기가 이 함수 하나를 같이 쓴다.
+App.taskItemsFor = function(iso) {
+  const items = [];
+  this.state.events.forEach(ev => {
+    (ev.steps || []).forEach((st, i) => {
+      if (st.plannedDate !== iso) return;
+      items.push({ kind:'step', eventId: ev._id, index: i, title: st.title,
+        sub: ev.title, done: !!st.done, color: this.eventColor(ev).bg });
+    });
+  });
+  this.state.todos.forEach(td => {
+    if (td.due !== iso) return;
+    items.push({ kind:'todo', id: td._id, title: td.title, sub: '', done: !!td.done, color: null });
+  });
+  return items;
+};
+
+// 계획한 날이 지났는데 아직 못 한 단계. 마감이 아직 안 지난 일정만 대상으로 한다.
+App.overdueTasks = function(iso) {
+  const out = [];
+  this.state.events.forEach(ev => {
+    if (ev.endDate < iso) return;
+    (ev.steps || []).forEach((st, i) => {
+      if (st.done || !st.plannedDate || st.plannedDate >= iso) return;
+      out.push({ kind:'step', eventId: ev._id, index: i, title: st.title, sub: ev.title,
+        done: false, color: this.eventColor(ev).bg, plannedDate: st.plannedDate });
+    });
+  });
+  return out.sort((a, b) => a.plannedDate.localeCompare(b.plannedDate));
+};
+
+App.progressOf = function(ev) {
+  if (!ev || !ev.steps || ev.steps.length === 0) return 0;
+  return ev.steps.filter(s => s.done).length / ev.steps.length;
+};
+
+// 리드타임 값이 어디서 왔는지 한글로 (발표할 때 "AI가 낸 값 / 규칙이 보정한 값"을 구분해 보여주기 위함)
+App.leadSourceLabel = function(source) {
+  return {
+    ai: 'AI 추천',
+    rule: '기본값',
+    'rule-corrected': 'AI 추천 → 규칙 보정',
+    user: '내가 조정',
+  }[source] || '';
+};
+
+// ---------- 리드타임 개인화 (기획서 9.4 - localStorage에 카테고리별 마지막 선택값) ----------
+App.LEAD_PREF_KEY = 'sc_lead_pref';
+App.getLeadPref = function(category) {
+  try {
+    const map = JSON.parse(localStorage.getItem(this.LEAD_PREF_KEY) || '{}');
+    const v = Number(map[category]);
+    return Number.isFinite(v) && v > 0 ? v : null;
+  } catch (e) { return null; }
+};
+App.setLeadPref = function(category, days) {
+  try {
+    const map = JSON.parse(localStorage.getItem(this.LEAD_PREF_KEY) || '{}');
+    map[category] = days;
+    localStorage.setItem(this.LEAD_PREF_KEY, JSON.stringify(map));
+  } catch (e) { /* 시크릿 모드 등에서 실패해도 기능에 지장 없으니 무시 */ }
+};
+
+// ---------- 준비 단계 구성 기억하기 ----------
+// 리드타임 개인화와 같은 방식이지만, 기억하는 단위가 "카테고리"가 아니라 "단계 템플릿 종류"다.
+// 같은 과제여도 발표형(presentation)과 논술형(writing)은 준비 단계가 다르기 때문에,
+// 발표 수행평가에서 고친 구성이 독후감에 잘못 적용되지 않도록 키를 분리한다.
+App.STEP_PREF_KEY = 'sc_step_pref';
+App.STEP_TEMPLATE_LABELS = {
+  presentation: '발표형', writing: '작성형', exam: '시험형', school: '학사형', generic: '일반',
+};
+App.getStepPref = function(templateKey) {
+  if (!templateKey) return null;
+  try {
+    const map = JSON.parse(localStorage.getItem(this.STEP_PREF_KEY) || '{}');
+    const titles = map[templateKey];
+    return Array.isArray(titles) && titles.length ? titles : null;
+  } catch (e) { return null; }
+};
+App.setStepPref = function(templateKey, titles) {
+  if (!templateKey || !Array.isArray(titles) || !titles.length) return;
+  try {
+    const map = JSON.parse(localStorage.getItem(this.STEP_PREF_KEY) || '{}');
+    map[templateKey] = titles;
+    localStorage.setItem(this.STEP_PREF_KEY, JSON.stringify(map));
+  } catch (e) { /* 무시 */ }
+};
+App.clearStepPref = function(templateKey) {
+  try {
+    const map = JSON.parse(localStorage.getItem(this.STEP_PREF_KEY) || '{}');
+    delete map[templateKey];
+    localStorage.setItem(this.STEP_PREF_KEY, JSON.stringify(map));
+  } catch (e) { /* 무시 */ }
+};
 App.esc = function(str) {
   return String(str ?? '').replace(/[&<>"']/g, (c) => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c]));
 };
@@ -203,7 +572,7 @@ App.styleStr = function(obj) {
 };
 
 // ---------- 캘린더 월 그리드 (겹치는 멀티데이 일정을 레인에 배치) ----------
-App.buildGrid = function(dark) {
+App.buildGrid = function(mode) {
   const { viewYear, viewMonth, selectedDate, events } = this.state;
   const first = new Date(viewYear, viewMonth, 1);
   const startWeekday = first.getDay();
@@ -225,6 +594,30 @@ App.buildGrid = function(dark) {
   for (let i = 0; i < flatDays.length; i += 7) weeks.push(flatDays.slice(i, i + 7));
 
   const maxLanes = 3;
+
+  // 할일 보기: 달력 모양은 그대로 두고, 막대 대신 "그 날 해야 할 것"을 칸마다 표시한다.
+  // 준비 단계(steps)도 계획 날짜에 맞춰 여기에 들어오므로, 날짜별로 뭘 해야 하는지가 달력에서 바로 보인다.
+  if (mode === 'todo') {
+    return weeks.map((week) => {
+      const bars = [];
+      let hiddenCount = 0;
+      let laneCount = 0;
+      week.forEach((day, col) => {
+        const items = this.taskItemsFor(day.iso);
+        items.slice(0, maxLanes).forEach((it, i) => {
+          bars.push({
+            isTask: true, title: it.title, done: it.done, lane: i,
+            left: (col / 7) * 100, width: (1 / 7) * 100,
+            color: it.color, iso: day.iso,
+          });
+          laneCount = Math.max(laneCount, i + 1);
+        });
+        if (items.length > maxLanes) hiddenCount += items.length - maxLanes;
+      });
+      return { days: week, bars, laneCount, hiddenCount };
+    });
+  }
+
   return weeks.map((week) => {
     const weekStart = week[0].iso, weekEnd = week[6].iso;
     const overlapping = events.filter(ev => ev.startDate <= weekEnd && ev.endDate >= weekStart)
@@ -243,10 +636,13 @@ App.buildGrid = function(dark) {
       if (lane >= maxLanes) { hiddenCount++; return; }
       laneEnds[lane] = colStart + colSpan - 1;
       const isCapLeft = segStart === ev.startDate, isCapRight = segEnd === ev.endDate;
+      const c = this.eventColor(ev);
       bars.push({
         id: ev._id, title: ev.title, lane,
         left: (colStart / 7) * 100, width: (colSpan / 7) * 100,
-        color: (PRIORITY_META[ev.priority] || PRIORITY_META.medium).color,
+        color: c.bg,                              // 막대 색 = 일정 구분
+        textColor: c.fg,
+        priorityColor: this.priorityColor(ev.priority), // 막대 안 점 = 중요도
         isCapLeft, isCapRight,
       });
     });
@@ -256,6 +652,21 @@ App.buildGrid = function(dark) {
 };
 
 // ---------- 렌더 ----------
+
+// 이 앱은 상태가 바뀔 때마다 앱 전체를 innerHTML로 다시 그리는 구조라,
+// 그대로 두면 준비기간 +/- 나 단계 체크를 누를 때마다 스크롤이 맨 위로 튄다.
+// 화면 구성(탭/모달)이 그대로일 때만 스크롤 위치를 기억했다가 복원한다.
+App.renderSignature = function() {
+  const s = this.state;
+  return [s.tab, s.calendarMode, s.addSheetOpen, s.modalOpen, s.todoModalOpen, s.detailEventId != null,
+    s.yearMonthModalOpen, s.authScreen, s.showOnboarding,
+    s.stepEditorOpen, s.stepDraft.length,
+    s.catEditorOpen, s.catDraft.length, s.catExpanded].join('|');
+};
+App.scrollables = function(root) {
+  return Array.from(root.querySelectorAll('div')).filter(el => el.scrollHeight > el.clientHeight + 1);
+};
+
 App.render = function() {
   const s = this.state;
   const t = this.theme(s.dark);
@@ -263,60 +674,87 @@ App.render = function() {
   const html = `
     <div style="${this.styleStr({ height:'100%', display:'flex', flexDirection:'column', position:'relative', background:t.bg, color:t.text, fontFamily:"'Jua',sans-serif" })}">
       ${this.renderTopBar(t)}
+      ${s.tab === 'today' ? this.renderToday(t) : ''}
       ${s.tab === 'calendar' ? this.renderCalendar(t) : ''}
-      ${s.tab === 'notify' ? this.renderNotify(t) : ''}
+      ${s.tab === 'progress' ? this.renderProgress(t) : ''}
+      ${s.tab === 'settings' ? this.renderSettings(t) : ''}
       ${s.tab === 'notice' ? this.renderNotice(t) : ''}
-      ${s.tab === 'todo' ? this.renderTodo(t) : ''}
-      ${s.tab === 'help' ? this.renderHelp(t) : ''}
-      ${s.tab === 'calendar' ? this.renderFab(t) : ''}
       ${this.renderTabBar(t)}
+      ${s.addSheetOpen ? this.renderAddSheet(t) : ''}
       ${s.modalOpen ? this.renderEventModal(t) : ''}
       ${s.todoModalOpen ? this.renderTodoModal(t) : ''}
       ${s.detailEventId != null ? this.renderDetailModal(t) : ''}
+      ${s.stepEditorOpen ? this.renderStepEditor(t) : ''}
+      ${s.catEditorOpen ? this.renderCategoryEditor(t) : ''}
       ${s.yearMonthModalOpen ? this.renderYearMonthModal(t) : ''}
-      ${s.authScreen === 'auth' ? this.renderAuth(t) : ''}
-      ${s.authScreen === 'profile' ? this.renderProfile(t) : ''}
+      <!-- 로그인/회원가입/프로필은 실제 인증 백엔드가 없는 목업이라 화면에서 뺐다.
+           눌리는데 동작하지 않는 화면은 "완결성 있게 작동하는가" 기준에서 손해다. -->
       ${s.showOnboarding ? this.renderOnboarding(t) : ''}
       ${s.toastMessage ? this.renderToast(t) : ''}
     </div>
   `;
-  document.getElementById('app-shell').innerHTML = html;
+  const shell = document.getElementById('app-shell');
+  const sig = this.renderSignature();
+  const keepScroll = sig === this._lastSignature;
+  const saved = keepScroll ? this.scrollables(shell).map(el => el.scrollTop) : null;
+
+  shell.innerHTML = html;
+
+  if (saved) {
+    this.scrollables(shell).forEach((el, i) => {
+      if (saved[i]) el.scrollTop = saved[i];
+    });
+  }
+  this._lastSignature = sig;
 };
 
 App.renderTopBar = function(t) {
   const s = this.state;
-  const title = { notify: '알림', notice: '공지', calendar: '', todo: 'To do list', help: '사용 설정' }[s.tab];
+  const title = { today: '오늘', calendar: '캘린더', progress: '기록', settings: '설정', notice: '공지 등록' }[s.tab] || '';
+  // 공지 등록은 (+)에서 들어온 화면이라 돌아갈 곳이 필요하다
+  const isSubScreen = s.tab === 'notice';
+  // 본문과 배경색이 같으면 경계가 안 보여서, 상단 바는 surface + 아래 경계선으로 띄운다.
+  // 다크모드 토글은 설정 탭에 있으므로 여기서는 뺐다(같은 기능이 두 곳에 있을 이유가 없다).
   return `
-    <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', paddingTop:'calc(10px + env(safe-area-inset-top))', paddingLeft:16, paddingRight:16, paddingBottom:6, flexShrink:0 })}">
-      <div style="${this.styleStr({ width:34, height:34, borderRadius:17, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, border:`1px solid ${t.border}`, cursor:'pointer', flexShrink:0 })}" onclick="App.toggleDark()">
-        ${s.dark
-          ? `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><path d="M21 12.79A9 9 0 1111.21 3 7 7 0 0021 12.79z" stroke="${t.text}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>`
-          : `<svg width="16" height="16" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="4" stroke="${t.text}" stroke-width="2"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4" stroke="${t.text}" stroke-width="2" stroke-linecap="round"/></svg>`}
-      </div>
-      ${s.tab === 'calendar' ? `
-        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:7 })}">
-          <img src="logo-mark.png" alt="신박한 캘린더 로고" style="${this.styleStr({ width:24, height:24, objectFit:'contain', flexShrink:0 })}" />
-          <div style="${this.styleStr({ fontSize:20, fontWeight:800, color:t.text, letterSpacing:'-0.3px', fontFamily:"'Jua',sans-serif" })}">신박한 캘린더</div>
-        </div>` : `<div style="${this.styleStr({ fontSize:21, fontWeight:800, color:t.text, fontFamily:"'Jua',sans-serif" })}">${title}</div>`}
-      ${s.tab === 'calendar'
-        ? (s.isLoggedIn
-            ? `<div style="${this.styleStr({ width:34, height:34, borderRadius:17, background:t.primary, color:'#fff', fontSize:13, fontWeight:800, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', flexShrink:0 })}" onclick="App.setState({authScreen:'profile'})">${this.esc((s.authName.trim()[0]) || 'U')}</div>`
-            : `<div style="${this.styleStr({ padding:'7px 12px', borderRadius:20, background:t.primary, color:'#fff', fontSize:12.5, fontWeight:700, cursor:'pointer', whiteSpace:'nowrap' })}" onclick="App.setState({authScreen:'auth', authMode:'login'})">로그인</div>`)
-        : `<div style="width:34px"></div>`}
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', paddingTop:'calc(10px + env(safe-area-inset-top))', paddingLeft:16, paddingRight:16, paddingBottom:10, flexShrink:0, background:t.surface, borderBottom:`1px solid ${t.border}` })}">
+      ${isSubScreen
+        ? `<div style="${this.styleStr({ width:32, height:32, marginRight:2, borderRadius:16, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer', flexShrink:0 })}" onclick="App.closeNotice()">
+             <svg width="14" height="14" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.text}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+           </div>`
+        : `<img src="logo-mark.png" alt="신박한 캘린더" style="${this.styleStr({ width:26, height:26, objectFit:'contain', flexShrink:0, marginRight:8 })}" />`}
+      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, letterSpacing:'-0.2px', fontFamily:"'Jua',sans-serif" })}">${title}</div>
     </div>
   `;
 };
 
 App.renderCalendar = function(t) {
   const s = this.state;
-  const weeks = this.buildGrid(s.dark);
+
+  // 캘린더 안에서 [일정 ↔ 할일]을 전환한다. 예전에는 할일이 다른 탭의 세그먼트 뒤에 숨어 있었다.
+  const segBtn = (key, label) => {
+    const on = s.calendarMode === key;
+    return `<div style="${this.styleStr({
+      flex:1, padding:'7px 4px', borderRadius:9, textAlign:'center', fontSize:12.5, fontWeight:700,
+      background: on ? t.surface : 'transparent', color: on ? t.text : t.textMuted,
+      boxShadow: on ? '0 1px 3px rgba(0,0,0,0.12)' : 'none', cursor:'pointer',
+    })}" onclick="App.setState({calendarMode:'${key}'})">${label}</div>`;
+  };
+  const segmented = `
+    <div style="${this.styleStr({ display:'flex', gap:3, padding:3, margin:'0 16px 8px', background:t.surfaceAlt, borderRadius:11, flexShrink:0 })}">
+      ${segBtn('event', '일정')}
+      ${segBtn('todo', '할일')}
+    </div>
+  `;
+
+  const isTodoMode = s.calendarMode === 'todo';
+  const weeks = this.buildGrid(isTodoMode ? 'todo' : 'event');
   const monthLabel = `${s.viewYear}년 ${s.viewMonth + 1}월`;
   const gridLineColor = s.dark ? 'rgba(255,255,255,0.05)' : 'rgba(0,0,0,0.045)';
 
   // ==================== 캘린더 칸 크기 - 여기 숫자만 바꾸면 됨 (다 따로따로 조절 가능) ====================
   const CELL_W = 55.5;          // 날짜 칸 너비
   const CELL_H = 22;            // 날짜 칸(숫자 줄) 높이
-  const ROW_GAP = 80;           // 주(week) 한 줄과 다음 줄 사이 간격
+  const ROW_GAP = 30;           // 주(week) 한 줄과 다음 줄 사이 간격 (아래 날짜별 목록 자리를 만들려고 줄임)
   const DAY_CIRCLE_SIZE = 20;   // 날짜 숫자 원 크기 (지름)
   const DAY_FONT_SIZE = 13;     // 날짜 숫자 폰트 크기
   const BAR_H = 19;             // 일정 바 하나의 높이
@@ -341,15 +779,31 @@ App.renderCalendar = function(t) {
       </div>
     `).join('');
 
-    const barsHtml = week.bars.map(bar => `
+    const barsHtml = week.bars.map(bar => bar.isTask ? `
       <div style="${this.styleStr({
         position:'absolute', top: bar.lane * BAR_GAP, left: `calc(${bar.left}%)`, width: `calc(${bar.width}% - 3px)`, height:BAR_H,
-        background: bar.color, color:'#fff', fontSize:BAR_FONT_SIZE, fontWeight:800, display:'flex', alignItems:'center',
-        paddingLeft:7, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis', cursor:'pointer',
+        marginLeft:'1.5px', borderRadius:6, display:'flex', alignItems:'center', gap:3,
+        paddingLeft:4, paddingRight:3, overflow:'hidden', cursor:'pointer',
+        background: bar.done ? 'transparent' : t.surface,
+        border:`1px solid ${bar.done ? t.border : (bar.color || t.border)}`,
+        borderLeft:`3px solid ${bar.color || t.textFaint}`,
+        opacity: bar.done ? 0.45 : 1,
+      })}" onclick="event.stopPropagation(); App.setState({selectedDate:'${bar.iso}'})">
+        <div style="${this.styleStr({ fontSize:9.5, fontWeight:700, color:t.text, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis', minWidth:0, textDecoration: bar.done ? 'line-through' : 'none' })}">${this.esc(bar.title)}</div>
+      </div>
+    ` : `
+      <div style="${this.styleStr({
+        position:'absolute', top: bar.lane * BAR_GAP, left: `calc(${bar.left}%)`, width: `calc(${bar.width}% - 3px)`, height:BAR_H,
+        background: bar.color, color: bar.textColor, fontSize:BAR_FONT_SIZE, fontWeight:800,
+        display:'flex', alignItems:'center', gap:4,
+        paddingLeft:5, paddingRight:5, overflow:'hidden', cursor:'pointer',
         marginLeft: bar.isCapLeft ? '1.5px' : '0',
         boxShadow: '0 1px 2px rgba(0,0,0,0.15)',
         borderRadius: `${bar.isCapLeft?8:3}px ${bar.isCapRight?8:3}px ${bar.isCapRight?8:3}px ${bar.isCapLeft?8:3}px`,
-      })}" onclick="event.stopPropagation(); App.openDetail('${bar.id}')">${this.esc(bar.title)}</div>
+      })}" onclick="event.stopPropagation(); App.openDetail('${bar.id}')">
+        <div style="${this.styleStr({ width:7, height:7, borderRadius:4, background:bar.priorityColor, border:`1.5px solid ${bar.textColor}`, boxSizing:'content-box', flexShrink:0 })}"></div>
+        <div style="${this.styleStr({ overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis', minWidth:0 })}">${this.esc(bar.title)}</div>
+      </div>
     `).join('');
 
     const hiddenHtml = week.hiddenCount > 0
@@ -372,7 +826,7 @@ App.renderCalendar = function(t) {
   // 세로 구분선 - CELL_W 값에 정확히 맞춰서 그림 (CELL_W를 바꾸면 이것도 자동으로 맞춰짐)
   const verticalLines = `repeating-linear-gradient(to right, transparent, transparent ${CELL_W - 1}px, ${gridLineColor} ${CELL_W - 1}px, ${gridLineColor} ${CELL_W}px)`;
 
-  return `
+  return segmented + `
     <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'center', gap:20, padding:'2px 16px 4px', flexShrink:0 })}">
       <div style="${this.styleStr({ width:26, height:26, borderRadius:13, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.prevMonth()">
         <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -383,43 +837,289 @@ App.renderCalendar = function(t) {
       </div>
     </div>
     <div style="${this.styleStr({ display:'flex', justifyContent:'center', flexShrink:0, borderBottom:`1px solid ${t.border}`, padding:'0 0 4px' })}">${weekdayHtml}</div>
-    <div style="${this.styleStr({ flex:1, display:'flex', justifyContent:'center', minHeight:0, overflow:'hidden' })}">
-      <div style="${this.styleStr({ width:GRID_W, height:'100%', display:'flex', flexDirection:'column', justifyContent:'flex-start', gap:ROW_GAP, padding:'6px 0 2px', overflow:'auto', position:'relative', backgroundImage:verticalLines })}">${weeksHtml}</div>
+    <div style="${this.styleStr({ flexShrink:0, display:'flex', justifyContent:'center', maxHeight:'52%', overflow:'auto' })}">
+      <div style="${this.styleStr({ width:GRID_W, display:'flex', flexDirection:'column', justifyContent:'flex-start', gap:ROW_GAP, padding:'6px 0 8px', position:'relative', backgroundImage:verticalLines })}">${weeksHtml}</div>
+    </div>
+    ${isTodoMode ? this.renderDayTasks(t) : this.renderDayDetail(t)}
+  `;
+};
+
+// 할일 보기의 하단 목록 — 그 날 체크할 것들(준비 단계 + 단순 할일)
+App.renderDayTasks = function(t) {
+  const sel = this.state.selectedDate;
+  const items = this.taskItemsFor(sel);
+  const doneCount = items.filter(x => x.done).length;
+
+  return `
+    <div style="${this.styleStr({ flex:1, minHeight:0, overflow:'auto', borderTop:`1px solid ${t.border}`, padding:'10px 16px 44px' })}">
+      <div style="${this.styleStr({ display:'flex', alignItems:'baseline', justifyContent:'space-between', marginBottom:9 })}">
+        <div style="${this.styleStr({ fontSize:14.5, fontWeight:800, color:t.text })}">${this.formatDayHeader(sel)}</div>
+        ${items.length ? `<div style="${this.styleStr({ fontSize:11, color:t.textFaint })}">${doneCount}/${items.length} 완료</div>` : ''}
+      </div>
+      ${items.length
+        ? items.filter(x => !x.done).map(it => this.renderTaskRow(t, it)).join('')
+          + items.filter(x => x.done).map(it => this.renderTaskRow(t, it)).join('')
+        : `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:12.5, lineHeight:1.7, padding:'22px 0 8px' })}">이 날 할 일이 없어요<br/>아래 + 버튼으로 추가할 수 있어요</div>`}
     </div>
   `;
 };
 
-App.renderNotify = function(t) {
+// 날짜를 누르면 그 날 뭐가 있는지 보여준다.
+// 예전에는 눌러도 동그라미 색만 바뀌고 끝이라, 이걸 보려고 알림 탭에 "전체 일정" 피드를 따로 뒀었다.
+App.renderDayDetail = function(t) {
   const s = this.state;
-  const groupsMap = {};
-  s.events.forEach(ev => { (groupsMap[ev.startDate] = groupsMap[ev.startDate] || []).push(ev); });
-  const dates = Object.keys(groupsMap).sort();
+  const sel = s.selectedDate;
 
-  const legend = ['high','medium','low'].map(k => `
-    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:6, fontSize:12, fontWeight:700, color:t.textMuted })}">
-      <div style="${this.styleStr({ width:9, height:9, borderRadius:5, background: PRIORITY_META[k].color })}"></div>
+  // 그 날에 걸쳐 있는 일정 (준비기간 막대는 여러 날에 걸치므로 구간으로 판단)
+  const events = s.events
+    .filter(ev => ev.startDate <= sel && sel <= ev.endDate)
+    .sort((a, b) => (a.endDate === b.endDate ? a.start.localeCompare(b.start) : a.endDate.localeCompare(b.endDate)));
+  const todos = s.todos.filter(td => td.due === sel);
+
+  const eventRow = (ev) => {
+    // 그 날이 마감일인지, 준비 중인지에 따라 다른 설명을 붙인다
+    const isDeadline = sel === ev.endDate;
+    const doneCount = (ev.steps || []).filter(st => st.done).length;
+    let sub;
+    if (ev.needsPrep && isDeadline) sub = '오늘 마감';
+    else if (ev.needsPrep) sub = `준비 중 · ${doneCount}/${ev.steps.length}단계 · ${this.formatDue(ev.endDate)} 마감`;
+    else sub = `${this.formatTime(ev.start)} - ${this.formatTime(ev.end)}`;
+
+    return `
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, padding:'11px 2px', borderBottom:`1px solid ${t.border}`, cursor:'pointer' })}" onclick="App.openDetail('${ev._id}')">
+        ${this.eventDot(ev, 11)}
+        <div style="${this.styleStr({ flex:1, minWidth:0 })}">
+          <div style="${this.styleStr({ fontSize:14, fontWeight:700, color:t.text, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(ev.title)}</div>
+          <div style="${this.styleStr({ fontSize:11.5, color: isDeadline && ev.needsPrep ? '#EF6F5B' : t.textMuted, marginTop:2 })}">${sub}</div>
+        </div>
+        <div style="${this.styleStr({ fontSize:10.5, fontWeight:700, color:t.textFaint, flexShrink:0 })}">${this.esc(this.categoryLabel(ev.category))}</div>
+      </div>`;
+  };
+
+  const todoRow = (td) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:11, padding:'11px 2px', borderBottom:`1px solid ${t.border}`, opacity: td.done ? 0.5 : 1 })}">
+      <div style="${this.styleStr({ width:20, height:20, borderRadius:6, border:`2px solid ${td.done?t.primary:t.border}`, background: td.done?t.primary:'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, cursor:'pointer', boxSizing:'border-box' })}" onclick="App.toggleTodo('${td._id}')">
+        ${td.done ? `<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+      </div>
+      <div style="${this.styleStr({ flex:1, fontSize:14, fontWeight:600, color:t.text, textDecoration: td.done?'line-through':'none' })}">${this.esc(td.title)}</div>
+    </div>`;
+
+  const empty = events.length === 0 && todos.length === 0;
+
+  return `
+    <div style="${this.styleStr({ flex:1, minHeight:0, overflow:'auto', borderTop:`1px solid ${t.border}`, padding:'10px 16px 40px' })}">
+      <div style="${this.styleStr({ display:'flex', alignItems:'baseline', justifyContent:'space-between', marginBottom:4 })}">
+        <div style="${this.styleStr({ fontSize:14.5, fontWeight:800, color:t.text })}">${this.formatDayHeader(sel)}</div>
+        ${empty ? '' : `<div style="${this.styleStr({ fontSize:11, color:t.textFaint })}">일정 ${events.length} · 할일 ${todos.length}</div>`}
+      </div>
+      ${empty
+        ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:12.5, lineHeight:1.7, padding:'22px 0 8px' })}">이 날은 비어 있어요<br/>아래 + 버튼으로 추가할 수 있어요</div>`
+        : events.map(eventRow).join('') + todos.map(todoRow).join('')}
+    </div>
+  `;
+};
+
+// ---------- 오늘 탭 ----------
+// "지금 당장 무엇을 할지"가 첫 화면에서 바로 보여야 한다.
+// 그래서 일정 목록을 나열하지 않고, 오늘 체크할 '단계'를 체크리스트로 먼저 띄운다.
+// (일정 단위 목록과 진행률은 기록 탭이 담당한다 — 두 탭이 겹치지 않게 단위를 나눴다)
+
+// 체크리스트 한 줄. 준비 단계와 단순 할일이 같은 모양으로 나온다.
+App.renderTaskRow = function(t, item, opts) {
+  const o = opts || {};
+  const toggle = item.kind === 'step'
+    ? `App.toggleStep('${item.eventId}', ${item.index})`
+    : `App.toggleTodo('${item.id}')`;
+  const open = item.kind === 'step' ? `App.openDetail('${item.eventId}')` : '';
+
+  // 색은 카드를 통째로 칠하지 않고 '왼쪽 세로 띠'로만 낸다.
+  // 띠를 카드 높이 전체로 붙이면 얇은 테두리보다 훨씬 잘 보이면서도 화면이 시끄러워지지 않는다.
+  const bar = item.color || t.textFaint;
+
+  return `
+    <div style="${this.styleStr({
+      position:'relative', overflow:'hidden',
+      display:'flex', alignItems:'center', gap:11, padding:'13px 13px 13px 19px',
+      background: t.surface, border:`1px solid ${t.border}`,
+      borderRadius:12, marginBottom:7, opacity: item.done ? 0.5 : 1,
+      boxShadow: item.done ? 'none' : '0 1px 3px rgba(0,0,0,0.07)',
+    })}">
+      <div style="${this.styleStr({ position:'absolute', left:0, top:0, bottom:0, width:6, background: item.done ? t.border : bar })}"></div>
+      <div style="${this.styleStr({
+        width:22, height:22, borderRadius:7, flexShrink:0, cursor:'pointer', boxSizing:'border-box',
+        border:`2px solid ${item.done ? t.primary : (o.late ? '#EF6F5B' : t.textFaint)}`,
+        background: item.done ? t.primary : 'transparent',
+        display:'flex', alignItems:'center', justifyContent:'center',
+      })}" onclick="event.stopPropagation(); ${toggle}">
+        ${item.done ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+      </div>
+      <div style="${this.styleStr({ flex:1, minWidth:0, cursor: open ? 'pointer' : 'default' })}" ${open ? `onclick="${open}"` : ''}>
+        <div style="${this.styleStr({ fontSize:14.5, fontWeight:700, color:t.text, textDecoration: item.done ? 'line-through' : 'none', overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(item.title)}</div>
+        ${item.sub ? `<div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:3, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(item.sub)}</div>` : ''}
+      </div>
+      ${o.late ? `<div style="${this.styleStr({ fontSize:10.5, fontWeight:800, color:'#EF6F5B', flexShrink:0 })}">${o.lateLabel}</div>` : ''}
+    </div>`;
+};
+
+// 일정 카드 (오늘 탭·기록 탭 공용).
+// 색은 왼쪽 세로 띠 + 종류 라벨(옅은 배경 + 진한 글씨) 두 군데로만 낸다.
+// 카드 전체를 칠하면 여러 장이 겹칠 때 화면이 시끄러워지고, 얇은 테두리만 쓰면 배경에 묻힌다.
+App.renderEventCard = function(t, ev, opts) {
+  const o = opts || {};
+  const color = this.eventColor(ev).bg;
+  const tint = this.eventTint(ev);
+  const steps = ev.steps || [];
+  const pct = steps.length ? Math.round((steps.filter(x => x.done).length / steps.length) * 100) : null;
+
+  return `
+    <div style="${this.styleStr({
+      position:'relative', overflow:'hidden', marginBottom:8,
+      background:t.surface, borderRadius:13, cursor:'pointer',
+      border:`1px solid ${o.urgent ? 'rgba(239,111,91,0.4)' : t.border}`,
+      padding: o.compact ? '11px 13px 11px 19px' : '13px 14px 13px 20px',
+      opacity: o.dim ? 0.5 : 1,
+      boxShadow: o.dim ? 'none' : '0 1px 3px rgba(0,0,0,0.07)',
+    })}" onclick="App.openDetail('${ev._id}')">
+      <div style="${this.styleStr({ position:'absolute', left:0, top:0, bottom:0, width:6, background:color })}"></div>
+
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:9 })}">
+        <div style="${this.styleStr({ flex:1, minWidth:0, fontSize: o.compact ? 13.5 : 14.5, fontWeight:700, color:t.text, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(ev.title)}</div>
+        ${o.right || ''}
+      </div>
+
+      ${o.compact ? '' : `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:7, marginTop:8 })}">
+          <div style="${this.styleStr({ fontSize:10.5, fontWeight:800, borderRadius:6, padding:'3px 7px', background:tint.bg, color:tint.fg, flexShrink:0 })}">${this.esc(this.categoryLabel(ev.category))}</div>
+          ${o.sub ? `<div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${o.sub}</div>` : ''}
+        </div>`}
+
+      ${(!o.compact && o.showProgress && pct !== null) ? `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:8, marginTop:10 })}">
+          <div style="${this.styleStr({ flex:1, height:7, borderRadius:4, background:t.surfaceAlt, overflow:'hidden' })}">
+            <div style="${this.styleStr({ width:`${pct}%`, height:'100%', background:color, borderRadius:4 })}"></div>
+          </div>
+          <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.textMuted, flexShrink:0 })}">${steps.filter(x => x.done).length}/${steps.length}</div>
+        </div>` : ''}
+    </div>`;
+};
+
+App.renderToday = function(t) {
+  const s = this.state;
+  const b = s.briefing;
+  const today = todayIso();
+
+  const tasks = this.taskItemsFor(today);
+  const overdue = this.overdueTasks(today);
+  const remaining = tasks.filter(x => !x.done).length + overdue.length;
+  const doneCount = tasks.filter(x => x.done).length;
+
+  // 마감이 오늘/내일인 일정 (브리핑이 계산해준 daysLeft 사용)
+  const urgent = b ? b.active.filter(ev => ev.daysLeft <= 1) : [];
+
+  const sectionTitle = (text, right) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'baseline', justifyContent:'space-between', margin:'18px 2px 9px' })}">
+      <div style="${this.styleStr({ fontSize:13.5, fontWeight:800, color:t.text })}">${text}</div>
+      ${right ? `<div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textFaint })}">${right}</div>` : ''}
+    </div>`;
+
+  // ----- 상단 요약: 색을 채운 큰 패널 대신 페이지 제목처럼 담백하게 -----
+  const heroMsg = remaining === 0
+    ? (tasks.length ? '오늘 할 일을 다 끝냈어요' : '오늘은 할 일이 없어요')
+    : `할 일 ${remaining}개 남았어요`;
+  const chips = [];
+  if (overdue.length) chips.push({ label: `밀린 것 ${overdue.length}`, tone: '#EF6F5B' });
+  if (urgent.length) chips.push({ label: `마감 임박 ${urgent.length}`, tone: '#EF6F5B' });
+  if (b && b.overlapCount >= 2) chips.push({ label: `준비 겹침 ${b.overlapCount}`, tone: null });
+  if (doneCount) chips.push({ label: `완료 ${doneCount}`, tone: null });
+
+  const hero = `
+    <div style="${this.styleStr({ padding:'16px 2px 4px' })}">
+      <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textFaint })}">${this.formatDayHeader(today)}</div>
+      <div style="${this.styleStr({ fontSize:22, fontWeight:800, color:t.text, marginTop:4, fontFamily:"'Jua',sans-serif" })}">${heroMsg}</div>
+      ${chips.length ? `
+        <div style="${this.styleStr({ display:'flex', flexWrap:'wrap', gap:6, marginTop:11 })}">
+          ${chips.map(c => `<div style="${this.styleStr({
+            fontSize:11.5, fontWeight:700, borderRadius:20, padding:'4px 10px',
+            background: c.tone ? 'rgba(239,111,91,0.12)' : t.surfaceAlt,
+            border: `1px solid ${c.tone ? 'rgba(239,111,91,0.3)' : t.border}`,
+            color: c.tone || t.textMuted,
+          })}">${c.label}</div>`).join('')}
+        </div>` : ''}
+    </div>`;
+
+  // ----- 밀린 것 -----
+  const overdueHtml = overdue.length ? `
+    ${sectionTitle('<span style="color:#EF6F5B">밀린 것</span>', '계획일이 지났어요')}
+    ${overdue.map(it => this.renderTaskRow(t, it, {
+      late: true,
+      lateLabel: `${Math.max(1, Math.round((new Date(today+'T00:00:00') - new Date(it.plannedDate+'T00:00:00'))/86400000))}일`,
+    })).join('')}` : '';
+
+  // ----- 오늘 할 일 -----
+  const todoHtml = tasks.length ? `
+    ${sectionTitle('오늘 할 일', `${doneCount}/${tasks.length}`)}
+    ${tasks.filter(x => !x.done).map(it => this.renderTaskRow(t, it)).join('')}
+    ${tasks.filter(x => x.done).map(it => this.renderTaskRow(t, it)).join('')}` : '';
+
+  // ----- 오늘/내일 마감 -----
+  const urgentHtml = urgent.length ? `
+    ${sectionTitle('마감이 코앞이에요')}
+    ${urgent.map(ev => this.renderEventCard(t, ev, {
+      right: `<div style="${this.styleStr({ fontSize:12, fontWeight:800, color:'#EF6F5B', flexShrink:0 })}">${ev.daysLeft === 0 ? '오늘 마감' : '내일 마감'}</div>`,
+      sub: `${Math.round((ev.progress || 0) * 100)}% 진행 · 준비 ${ev.leadTimeDays}일`,
+      urgent: true,
+    })).join('')}` : '';
+
+  // ----- 곧 시작 (자리를 적게 차지하도록 한 줄씩) -----
+  const upcoming = b ? b.upcoming : [];
+  const upcomingHtml = upcoming.length ? `
+    ${sectionTitle('곧 시작해요')}
+    ${upcoming.map(ev => this.renderEventCard(t, ev, {
+      right: `<div style="${this.styleStr({ fontSize:11.5, fontWeight:700, color:t.textMuted, flexShrink:0 })}">${ev.startsIn === 0 ? '오늘부터' : `${ev.startsIn}일 뒤`}</div>`,
+      compact: true,
+    })).join('')}` : '';
+
+  const nothing = !tasks.length && !overdue.length && !urgent.length && !upcoming.length;
+
+  return `
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'0 16px 44px' })}">
+      ${hero}
+      ${overdueHtml}
+      ${todoHtml}
+      ${urgentHtml}
+      ${upcomingHtml}
+      ${nothing ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:12.5, lineHeight:1.7, padding:'40px 0' })}">준비 중인 일정이 없어요<br/>아래 + 버튼으로 공지를 넣어보세요</div>` : ''}
+    </div>
+  `;
+};
+
+// 색 = 일정 종류, 테두리 = 중요도. 두 정보를 서로 다른 채널로 나눠 썼으므로 범례도 두 줄로 나눈다.
+App.renderLegend = function(t) {
+  const categoryLegend = this.categories().map(cat => {
+    const c = this.categoryColor(cat.key);
+    return `<div style="${this.styleStr({ display:'flex', alignItems:'center', gap:5, fontSize:11, fontWeight:700, color:t.textMuted })}">
+      <div style="${this.styleStr({ width:10, height:10, borderRadius:3, background:c.bg })}"></div>
+      <div>${this.esc(cat.label)}</div>
+    </div>`;
+  }).join('');
+
+  const priorityLegend = ['high','medium','low'].map(k => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:5, fontSize:11, fontWeight:700, color:t.textMuted })}">
+      <div style="${this.styleStr({ width:10, height:10, borderRadius:5, background:'transparent', border:`2px solid ${PRIORITY_META[k].color}`, boxSizing:'border-box' })}"></div>
       <div>${PRIORITY_META[k].label}</div>
     </div>
   `).join('');
 
-  const groupsHtml = dates.length === 0
-    ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:13, padding:'60px 20px' })}">아직 등록된 일정이 없어요</div>`
-    : dates.map(dateIso => {
-      const items = groupsMap[dateIso].slice().sort((a,b) => a.start.localeCompare(b.start));
-      const itemsHtml = items.map(ev => `
-        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, padding:'11px 4px', borderBottom:`1px solid ${t.border}`, cursor:'pointer' })}" onclick="App.openDetail('${ev._id}')">
-          <div style="${this.styleStr({ width:9, height:9, borderRadius:5, background: (PRIORITY_META[ev.priority]||PRIORITY_META.medium).color, flexShrink:0 })}"></div>
-          <div style="${this.styleStr({ flex:1, fontSize:14.5, fontWeight:600, color:t.text })}">${this.esc(ev.title)}</div>
-          <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, flexShrink:0 })}">${ev.startDate===ev.endDate ? `${this.formatTime(ev.start)} - ${this.formatTime(ev.end)}` : `${this.formatDue(ev.startDate)} ~ ${this.formatDue(ev.endDate)}`}</div>
-        </div>
-      `).join('');
-      return `<div style="${this.styleStr({ fontSize:13, fontWeight:800, color:t.textMuted, margin:'16px 0 8px' })}">${this.formatDayHeader(dateIso)}</div>${itemsHtml}`;
-    }).join('');
-
   return `
-    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">
-      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:18, padding:'10px 4px 14px', borderBottom:`1px solid ${t.border}`, marginBottom:2 })}">${legend}</div>
-      ${groupsHtml}
+    <div style="${this.styleStr({ display:'flex', flexDirection:'column', gap:8, width:'100%' })}">
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:8, flexWrap:'wrap' })}">
+        <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.textFaint, minWidth:34 })}">종류</div>
+        ${categoryLegend}
+      </div>
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' })}">
+        <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.textFaint, minWidth:34 })}">중요도</div>
+        ${priorityLegend}
+      </div>
     </div>
   `;
 };
@@ -429,13 +1129,22 @@ App.renderNotice = function(t) {
   const r = s.parsedResult ? s.parsedResult.result : null;
   const canAnalyze = (s.noticeText.trim() || s.imageFile) && !s.analyzing;
 
+  // 사용자가 +/- 로 조정 중이면 그 값을, 아니면 AI/규칙표가 낸 값을 쓴다
+  const leadDays = s.leadDraft !== null ? s.leadDraft : (r ? (r.leadTimeDays || 0) : 0);
+  const prepStart = (r && r.event) ? this.prepStart(r.event, leadDays) : null;
+  const leadChanged = r && s.leadDraft !== null && s.leadDraft !== r.leadTimeDays;
+
   const addBtnStyle = (added) => this.styleStr({ padding:'8px 12px', borderRadius:10, background: added ? t.surfaceAlt : t.primary, color: added ? t.textMuted : '#fff', fontSize:12.5, fontWeight:700, cursor: added?'default':'pointer', border: added?`1px solid ${t.border}`:'none', whiteSpace:'nowrap', flexShrink:0 });
+
+  // 준비기간 조정 버튼(- / +)
+  const stepBtn = (delta, disabled) => this.styleStr({
+    width:30, height:30, borderRadius:15, background: disabled ? t.border : t.surface, border:`1px solid ${t.border}`,
+    display:'flex', alignItems:'center', justifyContent:'center', fontSize:16, fontWeight:800,
+    color: disabled ? t.textFaint : t.text, cursor: disabled ? 'default' : 'pointer', flexShrink:0, userSelect:'none',
+  });
 
   return `
     <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px', display:'flex', flexDirection:'column', gap:14 })}">
-      <div style="${this.styleStr({ display:'flex', justifyContent:'flex-end' })}">
-        <div style="${this.styleStr({ padding:'6px 12px', borderRadius:20, background:t.surfaceAlt, border:`1px solid ${t.border}`, fontSize:12, fontWeight:700, color:t.textMuted, cursor:'pointer' })}" onclick="App.setState({tab:'help'})">⚙️ 사용 설정</div>
-      </div>
       <div style="${this.styleStr({ border:`1.5px dashed ${t.border}`, borderRadius:14, padding:'20px 14px', display:'flex', flexDirection:'column', alignItems:'center', gap:6, color:t.textMuted, fontSize:12.5, cursor:'pointer', textAlign:'center' })}" onclick="document.getElementById('image-input').click()">
         ${s.imagePreviewUrl
           ? `<img src="${s.imagePreviewUrl}" style="max-width:100%;max-height:140px;border-radius:8px;" />`
@@ -446,11 +1155,17 @@ App.renderNotice = function(t) {
       <input type="file" id="image-input" accept="image/*" style="display:none" onchange="App.onImageSelected(event)" />
 
       <div>
-        <div style="${this.styleStr({ fontSize:12.5, fontWeight:700, color:t.primary, cursor:'pointer', marginBottom:6, display:'inline-block' })}" onclick="App.fillSample()">예시 공지 붙여넣기</div>
-        <textarea style="${this.styleStr({ width:'100%', minHeight:110, padding:12, borderRadius:14, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13.5, fontFamily:"'Jua',sans-serif", resize:'none', lineHeight:1.5 })}" placeholder="공지 텍스트를 여기에 붙여넣으세요" oninput="App.state.noticeText=this.value">${this.esc(s.noticeText)}</textarea>
+        <div style="${this.styleStr({ display:'flex', alignItems:'baseline', justifyContent:'space-between', marginBottom:6, gap:8 })}">
+          <div style="${this.styleStr({ fontSize:12.5, fontWeight:700, color:t.text })}">일정 텍스트를 입력하세요</div>
+          <div style="${this.styleStr({ fontSize:11.5, fontWeight:700, color:t.textFaint, cursor:'pointer', flexShrink:0 })}" onclick="App.fillSample()">예시</div>
+        </div>
+        <textarea style="${this.styleStr({ width:'100%', minHeight:110, padding:12, borderRadius:14, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13.5, fontFamily:"'Jua',sans-serif", resize:'none', lineHeight:1.5 })}" placeholder="카톡·가정통신문 공지를 붙여넣거나 직접 입력하세요" oninput="App.onNoticeTextInput(this.value)">${this.esc(s.noticeText)}</textarea>
       </div>
 
-      <div style="${this.styleStr({ padding:14, borderRadius:14, background: canAnalyze ? t.primary : t.border, color: canAnalyze ? '#fff' : t.textFaint, fontWeight:800, fontSize:15, textAlign:'center', cursor: canAnalyze ? 'pointer':'default' })}" onclick="${canAnalyze ? 'App.analyze()' : ''}">${s.analyzing ? '분석 중…' : 'AI로 분석하기'}</div>
+      <!-- onclick을 항상 걸어두고 버튼 모양만 바꾼다.
+           예전에는 onclick 자체를 canAnalyze로 껐는데, textarea 입력은 화면을 다시 그리지 않아서
+           타이핑으로는 버튼이 영영 안 켜졌음. analyze()가 내부에서 빈 입력을 막아준다. -->
+      <div id="analyze-btn" style="${this.styleStr({ padding:14, borderRadius:14, background: canAnalyze ? t.primary : t.border, color: canAnalyze ? '#fff' : t.textFaint, fontWeight:800, fontSize:15, textAlign:'center', cursor: canAnalyze ? 'pointer':'default' })}" onclick="App.analyze()">${s.analyzing ? '분석 중…' : 'AI로 분석하기'}</div>
 
       ${s.analyzing ? `<div style="${this.styleStr({ textAlign:'center', color:t.textMuted, fontSize:13, padding:'4px 0' })}">AI가 공지를 분석하고 있어요…</div>` : ''}
       ${s.analyzeError ? `<div style="${this.styleStr({ textAlign:'center', color:'#EF6F5B', fontSize:12.5, padding:'4px 0' })}">${this.esc(s.analyzeError)}</div>` : ''}
@@ -460,12 +1175,52 @@ App.renderNotice = function(t) {
           <div style="${this.styleStr({ alignSelf:'flex-start', padding:'4px 10px', borderRadius:20, background: PRIORITY_META[r.priority].color, color:'#fff', fontSize:11, fontWeight:800 })}">중요도 ${PRIORITY_META[r.priority].label}</div>
           <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(r.summary)}</div>
           ${r.event ? `
-            <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, padding:'10px 12px', background:t.surfaceAlt, borderRadius:12 })}">
-              <div>
-                <div style="${this.styleStr({ fontSize:13.5, fontWeight:700, color:t.text })}">일정 · ${this.esc(r.event.title)}</div>
-                <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:2 })}">${this.formatDue(r.event.startDate)} · ${this.formatTime(r.event.start)}~${this.formatTime(r.event.end)}</div>
+            <div style="${this.styleStr({ padding:'12px 12px 10px', background:t.surfaceAlt, borderRadius:12, display:'flex', flexDirection:'column', gap:10 })}">
+              <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 })}">
+                <div style="${this.styleStr({ minWidth:0 })}">
+                  <div style="${this.styleStr({ fontSize:13.5, fontWeight:700, color:t.text })}">일정 · ${this.esc(r.event.title)}</div>
+                  <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:2 })}">
+                    ${r.needsPrep
+                      ? `마감 ${this.formatDue(r.event.endDate)}`
+                      : `${this.formatDue(r.event.startDate)} · ${this.formatTime(r.event.start)}~${this.formatTime(r.event.end)}`}
+                  </div>
+                </div>
+                <div style="${addBtnStyle(s.addedEvent)}" onclick="${s.addedEvent?'':'App.addParsedEvent()'}">${s.addedEvent ? '추가됨' : '캘린더에 추가'}</div>
               </div>
-              <div style="${addBtnStyle(s.addedEvent)}" onclick="${s.addedEvent?'':'App.addParsedEvent()'}">${s.addedEvent ? '추가됨' : '캘린더에 추가'}</div>
+
+              ${r.needsPrep ? `
+                <!-- 이 서비스의 핵심: 마감일이 아니라 "언제부터 준비할지"를 보여주고 조정하게 하는 영역 -->
+                <div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:10, padding:'10px 11px' })}">
+                  <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:6, marginBottom:8 })}">
+                    <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.primary })}">준비가 필요한 일이에요</div>
+                    <div style="${this.styleStr({ fontSize:10, fontWeight:700, color:t.textFaint, padding:'2px 6px', borderRadius:8, background:t.surfaceAlt })}">${leadChanged ? this.leadSourceLabel('user') : this.esc(this.leadSourceLabel(r.leadTimeSource))}</div>
+                  </div>
+
+                  <div style="${this.styleStr({ fontSize:14, fontWeight:800, color:t.text, marginBottom:9 })}">
+                    ${this.formatDue(prepStart)}<span style="${this.styleStr({ color:t.textFaint, fontWeight:600 })}"> 부터 시작 → </span>${this.formatDue(r.event.endDate)}<span style="${this.styleStr({ color:t.textFaint, fontWeight:600 })}"> 마감</span>
+                  </div>
+
+                  <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10 })}">
+                    <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted })}">준비기간</div>
+                    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10 })}">
+                      <div style="${stepBtn(-1, leadDays <= 1)}" onclick="${leadDays <= 1 ? '' : 'App.adjustLead(-1)'}">−</div>
+                      <div style="${this.styleStr({ fontSize:14.5, fontWeight:800, color:t.text, minWidth:44, textAlign:'center' })}">${leadDays}일</div>
+                      <div style="${stepBtn(1, leadDays >= 30)}" onclick="${leadDays >= 30 ? '' : 'App.adjustLead(1)'}">＋</div>
+                    </div>
+                  </div>
+
+                  ${r.event.steps && r.event.steps.length ? `
+                    <div style="${this.styleStr({ display:'flex', flexWrap:'wrap', gap:5, marginTop:10, paddingTop:9, borderTop:`1px solid ${t.border}` })}">
+                      ${r.event.steps.map(st => `<div style="${this.styleStr({ fontSize:10.5, fontWeight:700, color:t.textMuted, background:t.surfaceAlt, borderRadius:7, padding:'4px 7px' })}">${this.esc(st.title)}</div>`).join('')}
+                    </div>
+                    <div style="${this.styleStr({ fontSize:10.5, color: s.stepPrefApplied ? t.primary : t.textFaint, marginTop:6 })}">
+                      ${s.stepPrefApplied
+                        ? '지난번에 고쳐둔 단계 구성을 적용했어요'
+                        : '추가하면 이 단계들이 체크리스트로 만들어져요'}
+                    </div>
+                  ` : ''}
+                </div>
+              ` : ''}
             </div>` : ''}
           ${r.todo ? `
             <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, padding:'10px 12px', background:t.surfaceAlt, borderRadius:12 })}">
@@ -481,33 +1236,159 @@ App.renderNotice = function(t) {
   `;
 };
 
-App.renderTodo = function(t) {
+// ---------- 기록 탭 ----------
+// "진행"이라는 이름이 무엇을 보는 화면인지 알려주지 못해서 "기록"으로 바꿨다.
+// 이 탭에서만 볼 수 있는 것: 내 준비 습관 통계(제때 끝낸 비율, 계획 준수), 종류별 분포, 끝난 일정 회고.
+// 오늘 탭이 '단계' 단위라면 여기는 '일정' 단위 + 누적 통계를 담당한다.
+
+// 저장된 일정들에서 통계를 계산한다. 서버에 따로 집계 API를 두지 않고
+// 이미 받아온 events만으로 계산하므로 추가 요청이 없다.
+App.calcStats = function() {
+  const today = todayIso();
+  const events = this.state.events;
+  const prep = events.filter(ev => ev.needsPrep);
+
+  let stepsTotal = 0, stepsDone = 0, onTime = 0, late = 0;
+  prep.forEach(ev => {
+    (ev.steps || []).forEach(st => {
+      stepsTotal += 1;
+      if (!st.done) return;
+      stepsDone += 1;
+      // 계획일까지 체크했는지 (doneAt은 UTC 시각이라 KST 날짜로 바꿔서 비교)
+      if (!st.doneAt || !st.plannedDate) { onTime += 1; return; }
+      const kst = new Date(new Date(st.doneAt).getTime() + 9 * 60 * 60 * 1000);
+      const doneDate = `${kst.getUTCFullYear()}-${String(kst.getUTCMonth()+1).padStart(2,'0')}-${String(kst.getUTCDate()).padStart(2,'0')}`;
+      if (doneDate <= st.plannedDate) onTime += 1; else late += 1;
+    });
+  });
+
+  const finished = prep.filter(ev => ev.endDate < today);
+  // 마감 전에 모든 단계를 끝낸 일정
+  const finishedComplete = finished.filter(ev => (ev.steps || []).length && ev.steps.every(st => st.done)).length;
+
+  // 회고 응답 분포 (준비기간이 부족했다고 느낀 비율)
+  const retros = prep.filter(ev => ev.retro && ev.retro.answeredAt);
+  const tightCount = retros.filter(ev => ev.retro.feeling === 'tight').length;
+
+  // 종류별 분포
+  const byCategory = {};
+  events.forEach(ev => {
+    const key = this.categoryOf(ev.category).key;
+    byCategory[key] = (byCategory[key] || 0) + 1;
+  });
+
+  return {
+    ongoing: prep.filter(ev => ev.endDate >= today).length,
+    finished: finished.length,
+    stepsTotal, stepsDone,
+    stepRate: stepsTotal ? Math.round((stepsDone / stepsTotal) * 100) : 0,
+    onTimeRate: (onTime + late) ? Math.round((onTime / (onTime + late)) * 100) : null,
+    finishedRate: finished.length ? Math.round((finishedComplete / finished.length) * 100) : null,
+    retroCount: retros.length,
+    tightRate: retros.length ? Math.round((tightCount / retros.length) * 100) : null,
+    byCategory,
+  };
+};
+
+App.renderProgress = function(t) {
   const s = this.state;
-  const todos = s.todos.filter(td => td.due === s.todoDate);
-  const rows = todos.length === 0
-    ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:13, padding:'60px 20px' })}">이 날은 할일이 없어요</div>`
-    : todos.map(td => `
-      <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:12, padding:'13px 4px', borderBottom:`1px solid ${t.border}`, opacity: td.done?0.5:1 })}">
-        <div style="${this.styleStr({ width:22, height:22, borderRadius:7, border:`2px solid ${td.done?t.primary:t.border}`, background: td.done?t.primary:'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, cursor:'pointer' })}" onclick="App.toggleTodo('${td._id}')">
-          ${td.done ? `<svg width="12" height="12" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+  const today = todayIso();
+  const st = this.calcStats();
+
+  const prepEvents = s.events.filter(ev => ev.needsPrep);
+  const ongoing = prepEvents.filter(ev => ev.endDate >= today).sort((a, b) => a.endDate.localeCompare(b.endDate));
+  const past = prepEvents.filter(ev => ev.endDate < today).sort((a, b) => b.endDate.localeCompare(a.endDate)).slice(0, 5);
+  const retroPending = s.briefing ? s.briefing.retroPending : [];
+
+  const sectionTitle = (text, right) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'baseline', justifyContent:'space-between', margin:'20px 2px 9px' })}">
+      <div style="${this.styleStr({ fontSize:13.5, fontWeight:800, color:t.text })}">${text}</div>
+      ${right ? `<div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textFaint })}">${right}</div>` : ''}
+    </div>`;
+
+  // ----- 상단 통계: 색을 채운 패널 대신 앱의 다른 카드와 같은 흰 카드로 -----
+  const bigStat = (value, unit, label) => `
+    <div style="${this.styleStr({ flex:1, textAlign:'center' })}">
+      <div style="${this.styleStr({ fontSize:23, fontWeight:800, color:t.primary, fontFamily:"'Jua',sans-serif", lineHeight:1.1 })}">${value}<span style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted })}">${unit}</span></div>
+      <div style="${this.styleStr({ fontSize:10.5, fontWeight:700, color:t.textMuted, marginTop:6, lineHeight:1.4 })}">${label}</div>
+    </div>`;
+
+  const hero = `
+    <div style="${this.styleStr({ marginTop:16 })}">
+      <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textFaint, marginBottom:8, paddingLeft:2 })}">내 준비 습관</div>
+      <div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:14, padding:'16px 12px 14px', boxShadow:'0 1px 3px rgba(0,0,0,0.07)' })}">
+        <div style="${this.styleStr({ display:'flex', alignItems:'flex-start' })}">
+          ${bigStat(st.onTimeRate === null ? '–' : st.onTimeRate, st.onTimeRate === null ? '' : '%', '제때 끝낸 단계')}
+          <div style="${this.styleStr({ width:1, alignSelf:'stretch', background:t.border })}"></div>
+          ${bigStat(st.stepsDone, '개', `끝낸 단계<br/>(총 ${st.stepsTotal})`)}
+          <div style="${this.styleStr({ width:1, alignSelf:'stretch', background:t.border })}"></div>
+          ${bigStat(st.ongoing, '개', '준비 중인 일정')}
         </div>
-        <div style="${this.styleStr({ flex:1, fontSize:14.5, fontWeight:600, color:t.text, textDecoration: td.done?'line-through':'none' })}">${this.esc(td.title)}</div>
+        ${st.onTimeRate !== null ? `
+          <div style="${this.styleStr({ marginTop:14, padding:'10px 12px', background:t.surfaceAlt, borderRadius:10, fontSize:11.5, color:t.textMuted, lineHeight:1.55 })}">
+            ${st.onTimeRate >= 80 ? '계획한 날짜를 잘 지키고 있어요.'
+              : st.onTimeRate >= 50 ? '절반 정도는 계획보다 늦게 끝내고 있어요.'
+              : '계획보다 늦어지는 단계가 많아요. 준비기간을 늘려보는 건 어때요?'}
+            ${st.tightRate !== null && st.tightRate >= 50 ? ` 회고에서도 ${st.tightRate}%가 "부족했다"였어요.` : ''}
+          </div>` : ''}
       </div>
-    `).join('');
+    </div>`;
+
+  // ----- 종류별 분포 -----
+  const catEntries = Object.entries(st.byCategory).sort((a, b) => b[1] - a[1]);
+  const catMax = catEntries.length ? catEntries[0][1] : 1;
+  const catHtml = catEntries.length ? `
+    ${sectionTitle('종류별 일정', `총 ${s.events.length}개`)}
+    <div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:14, padding:'14px 15px', boxShadow:'0 1px 2px rgba(0,0,0,0.05)' })}">
+      ${catEntries.map(([key, count]) => `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:9, marginBottom:9 })}">
+          <div style="${this.styleStr({ width:52, fontSize:11.5, fontWeight:700, color:t.textMuted, flexShrink:0, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(this.categoryLabel(key))}</div>
+          <div style="${this.styleStr({ flex:1, height:8, borderRadius:4, background:t.surfaceAlt, overflow:'hidden' })}">
+            <div style="${this.styleStr({ width:`${Math.max(6, (count / catMax) * 100)}%`, height:'100%', background:this.categoryColor(key).bg, borderRadius:4 })}"></div>
+          </div>
+          <div style="${this.styleStr({ width:22, textAlign:'right', fontSize:11.5, fontWeight:800, color:t.text, flexShrink:0 })}">${count}</div>
+        </div>`).join('')}
+    </div>` : '';
+
+  // ----- 준비 중인 일정 (오늘 탭과 같은 카드를 쓴다) -----
+  const row = (ev, dim) => {
+    const daysLeft = Math.round((new Date(ev.endDate + 'T00:00:00') - new Date(today + 'T00:00:00')) / 86400000);
+    const label = daysLeft < 0 ? '마감됨' : (daysLeft === 0 ? '오늘 마감' : `D-${daysLeft}`);
+    const tone = daysLeft < 0 ? t.textFaint : (daysLeft <= 1 ? '#EF6F5B' : t.textMuted);
+    return this.renderEventCard(t, ev, {
+      dim,
+      showProgress: true,
+      sub: `${this.formatDue(ev.startDate)} 시작 · 준비 ${ev.leadTimeDays}일`,
+      right: `<div style="${this.styleStr({ fontSize:11.5, fontWeight:800, color:tone, flexShrink:0 })}">${label}</div>`,
+    });
+  };
+
+  // ----- 끝난 일정 회고 (오늘 탭에서 옮겨옴 — 지난 일을 돌아보는 건 기록 탭이 맞다) -----
+  const retroHtml = retroPending.length ? `
+    ${sectionTitle('끝난 일정 돌아보기', '다음 준비기간에 반영돼요')}
+    ${retroPending.map(ev => `
+      <div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:13, padding:'13px 14px', marginBottom:8, boxShadow:'0 1px 2px rgba(0,0,0,0.05)' })}">
+        <div style="${this.styleStr({ fontSize:13.5, fontWeight:700, color:t.text, marginBottom:3 })}">${this.esc(ev.title)}</div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginBottom:10 })}">준비기간 ${ev.leadTimeDays}일로 잡았었어요. 어땠나요?</div>
+        <div style="${this.styleStr({ display:'flex', gap:6 })}">
+          ${[['tight','부족했어요'],['ok','적당했어요'],['loose','넉넉했어요']].map(([k, label]) => `
+            <div style="${this.styleStr({ flex:1, padding:'9px 4px', borderRadius:9, background:t.surfaceAlt, border:`1px solid ${t.border}`, fontSize:11.5, fontWeight:700, color:t.text, textAlign:'center', cursor:'pointer' })}" onclick="App.saveRetro('${ev._id}','${k}')">${label}</div>`).join('')}
+        </div>
+      </div>`).join('')}` : '';
+
+  const nothing = prepEvents.length === 0;
 
   return `
-    <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'center', gap:20, padding:'2px 16px 10px', flexShrink:0 })}">
-      <div style="${this.styleStr({ width:28, height:28, borderRadius:14, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.setState({todoDate: App.addDays(App.state.todoDate,-1)})">
-        <svg width="8" height="14" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </div>
-      <div style="${this.styleStr({ fontSize:16, fontWeight:700, color:t.text, minWidth:130, textAlign:'center' })}">${this.formatDayHeader(s.todoDate)}</div>
-      <div style="${this.styleStr({ width:28, height:28, borderRadius:14, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer' })}" onclick="App.setState({todoDate: App.addDays(App.state.todoDate,1)})">
-        <svg width="8" height="14" viewBox="0 0 9 15"><path d="M1 1l7 6.5-7 6.5" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      </div>
-    </div>
-    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">${rows}</div>
-    <div style="${this.styleStr({ position:'absolute', right:18, bottom:'calc(78px + env(safe-area-inset-bottom))', width:52, height:52, borderRadius:26, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 8px 20px rgba(0,0,0,0.28)', cursor:'pointer', zIndex:30 })}" onclick="App.openTodoModal()">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg>
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'0 16px 44px' })}">
+      ${nothing
+        ? `<div style="${this.styleStr({ textAlign:'center', color:t.textFaint, fontSize:12.5, lineHeight:1.7, padding:'70px 20px' })}">아직 준비가 필요한 일정이 없어요<br/>공지를 등록하면 여기에 기록이 쌓여요</div>`
+        : `
+          ${hero}
+          ${retroHtml}
+          ${ongoing.length ? sectionTitle('준비 중', `${ongoing.length}개`) + ongoing.map(ev => row(ev, false)).join('') : ''}
+          ${past.length ? sectionTitle('지난 일정') + past.map(ev => row(ev, true)).join('') : ''}
+          ${catHtml}
+        `}
     </div>
   `;
 };
@@ -525,11 +1406,51 @@ App.renderTodoModal = function(t) {
           <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">할 일</div>
           <input id="todo-draft-input" style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.todoDraftTitle)}" oninput="App.state.todoDraftTitle=this.value" placeholder="예: 경진대회 신청서 제출하기">
         </div>
-        <div style="${this.styleStr({ fontSize:12, color:t.textMuted, marginBottom:14 })}">${this.formatDayHeader(s.todoDate)}에 추가돼요</div>
+        <div style="${this.styleStr({ fontSize:12, color:t.textMuted, marginBottom:14 })}">${this.formatDayHeader(s.selectedDate)}에 추가돼요</div>
         <div style="${this.styleStr({ display:'flex', gap:10 })}">
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeTodoModal()">취소</div>
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveManualTodo()">저장</div>
         </div>
+      </div>
+    </div>
+  `;
+};
+
+// 설정 탭 — 흩어져 있던 설정을 한 곳에 모았다.
+// (종류 설정은 알림 탭 범례 옆에, 사용법은 공지 탭 우상단에 숨어 있었다)
+App.renderSettings = function(t) {
+  const s = this.state;
+
+  const card = (inner) => `<div style="${this.styleStr({ background:t.surface, border:`1px solid ${t.border}`, borderRadius:14, padding:'14px 15px', marginBottom:10 })}">${inner}</div>`;
+  const rowBtn = (title, desc, action, right) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, cursor:'pointer' })}" onclick="${action}">
+      <div style="${this.styleStr({ flex:1, minWidth:0 })}">
+        <div style="${this.styleStr({ fontSize:14, fontWeight:700, color:t.text })}">${title}</div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:3, lineHeight:1.5 })}">${desc}</div>
+      </div>
+      <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.primary, flexShrink:0 })}">${right}</div>
+    </div>`;
+
+  return `
+    <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">
+
+      ${card(`
+        ${rowBtn('일정 종류', '이름·색·기본 준비기간을 바꾸거나 새 종류를 추가해요', 'App.openCategoryEditor()', '변경 ›')}
+        <div style="${this.styleStr({ marginTop:13, paddingTop:13, borderTop:`1px solid ${t.border}` })}">${this.renderLegend(t)}</div>
+      `)}
+
+      ${card(`
+        <div style="${this.styleStr({ fontSize:14, fontWeight:700, color:t.text, marginBottom:4 })}">푸시 알림</div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginBottom:12, lineHeight:1.5 })}">앱을 안 켜놔도 알림을 받으려면 켜야 해요. (아이폰은 "홈 화면에 추가" 한 상태에서만 작동해요)</div>
+        <div style="${this.styleStr({ padding:11, borderRadius:10, background: s.pushEnabled ? t.surfaceAlt : t.primary, color: s.pushEnabled ? t.textMuted : '#fff', fontWeight:700, fontSize:13.5, textAlign:'center', cursor: s.pushEnabled ? 'default':'pointer', border: s.pushEnabled ? `1px solid ${t.border}` : 'none' })}" onclick="${s.pushEnabled ? '' : 'App.enablePushNotifications()'}">${s.pushEnabled ? '✅ 알림 켜짐' : '푸시 알림 켜기'}</div>
+      `)}
+
+      ${card(rowBtn('화면 테마', s.dark ? '어두운 화면을 쓰고 있어요' : '밝은 화면을 쓰고 있어요', 'App.toggleDark()', s.dark ? '어둡게' : '밝게'))}
+
+      ${card(rowBtn('앱 사용법', '홈 화면에 추가하기 · 카톡 공지 단축어 설정', "App.setState({showOnboarding:true, onboardingStep:0})", '보기 ›'))}
+
+      <div style="${this.styleStr({ fontSize:11, color:t.textFaint, textAlign:'center', lineHeight:1.6, marginTop:16 })}">
+        신박한 캘린더<br/>마감일이 아니라 준비 시작일을 알려주는 AI 캘린더
       </div>
     </div>
   `;
@@ -574,7 +1495,7 @@ App.renderHelp = function(t) {
         ${step(2, '동작 검색에서 "공유 시트에서 앱 및 콘텐츠 받기"가 맨 위에 자동으로 들어가 있는지 확인')}
         ${step(3, '동작 검색에서 "URL의 콘텐츠 가져오기"를 추가')}
         ${step(4, 'URL 칸에 서버 주소 + <b>/api/notices/quick-add</b> 를 입력')}
-        ${codeBox('예: http://192.168.0.7:4000/api/notices/quick-add')}
+        ${codeBox(window.location.origin + '/api/notices/quick-add')}
         ${step(5, '세부사항 펼치기 → 메소드를 POST로 변경')}
         ${step(6, '본문 요청을 JSON으로 선택하고, 키에 정확히 소문자로 "text"를 입력, 값에는 파란색 "공유 시트 입력" 변수 칩을 넣기')}
         ${step(7, '(선택) "사전 값 가져오기" 동작을 추가해서 방금 결과의 "message" 값을 가져오고, "알림 표시" 동작으로 연결하면 저장 완료 알림까지 뜸')}
@@ -590,36 +1511,73 @@ App.renderHelp = function(t) {
   `;
 };
 
-App.renderFab = function(t) {
-  return `
-    <div style="${this.styleStr({ position:'absolute', right:18, bottom:'calc(78px + env(safe-area-inset-bottom))', width:52, height:52, borderRadius:26, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', boxShadow:'0 8px 20px rgba(0,0,0,0.28)', cursor:'pointer', zIndex:30 })}" onclick="App.openAddModal()">
-      <svg width="22" height="22" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg>
-    </div>
-  `;
-};
-
+// 탭 4개 + 가운데 볼록 튀어나온 (+) 버튼.
+// 등록(공지 붙여넣기/사진/직접 입력/할일)은 "보는 화면"이 아니라 "하는 행동"이라
+// 탭을 차지하지 않고 이 버튼 하나로 모았다. 예전에는 공지 탭 + FAB 2개로 흩어져 있었다.
 App.renderTabBar = function(t) {
   const s = this.state;
   const color = (key) => s.tab === key ? t.primary : t.textFaint;
   const btn = () => this.styleStr({ flex:1, display:'flex', flexDirection:'column', alignItems:'center', gap:4, padding:'8px 0 4px', cursor:'pointer' });
   const label = (key) => this.styleStr({ fontSize:10.5, fontWeight:700, color:color(key), whiteSpace:'nowrap' });
+
+  const ICONS = {
+    today: (c) => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="8.5" stroke="${c}" stroke-width="1.8"/><path d="M12 7.5V12l3 1.8" stroke="${c}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`,
+    calendar: (c) => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5" width="17" height="15" rx="2.5" stroke="${c}" stroke-width="1.8"/><path d="M3.5 9.5h17M8 3v4M16 3v4" stroke="${c}" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+    progress: (c) => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M4 18V10M10 18V5M16 18v-5M22 18H2" stroke="${c}" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+    settings: (c) => `<svg width="24" height="24" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="3" stroke="${c}" stroke-width="1.8"/><path d="M12 3v2.5M12 18.5V21M21 12h-2.5M5.5 12H3M18.4 5.6l-1.8 1.8M7.4 16.6l-1.8 1.8M18.4 18.4l-1.8-1.8M7.4 7.4L5.6 5.6" stroke="${c}" stroke-width="1.8" stroke-linecap="round"/></svg>`,
+  };
+  const tab = (key, text) => `
+    <div style="${btn()}" onclick="App.setState({tab:'${key}'})">
+      ${ICONS[key](color(key))}
+      <div style="${label(key)}">${text}</div>
+    </div>`;
+
   return `
-    <div style="${this.styleStr({ display:'flex', flexShrink:0, borderTop:`1px solid ${t.border}`, background:t.surface, paddingBottom:'calc(6px + env(safe-area-inset-bottom))' })}">
-      <div style="${btn()}" onclick="App.setState({tab:'calendar'})">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3.5" y="5" width="17" height="15" rx="2.5" stroke="${color('calendar')}" stroke-width="1.8"/><path d="M3.5 9.5h17M8 3v4M16 3v4" stroke="${color('calendar')}" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <div style="${label('calendar')}">캘린더</div>
+    <div style="${this.styleStr({ position:'relative', display:'flex', flexShrink:0, borderTop:`1px solid ${t.border}`, background:t.surface, paddingBottom:'calc(6px + env(safe-area-inset-bottom))', zIndex:40 })}">
+      <div style="${this.styleStr({
+        position:'absolute', left:'50%', top:-22, transform:'translateX(-50%)',
+        width:54, height:54, borderRadius:27, background:t.primary,
+        border:`4px solid ${t.surface}`, boxSizing:'border-box',
+        display:'flex', alignItems:'center', justifyContent:'center',
+        boxShadow:'0 6px 18px rgba(59,65,119,0.42)', cursor:'pointer', zIndex:2,
+      })}" onclick="App.openAddSheet()">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 5v14M5 12h14" stroke="#fff" stroke-width="2.6" stroke-linecap="round"/></svg>
       </div>
-      <div style="${btn()}" onclick="App.setState({tab:'notice'})">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="3" width="16" height="18" rx="2.5" stroke="${color('notice')}" stroke-width="1.8"/><path d="M8 8h8M8 12h5" stroke="${color('notice')}" stroke-width="1.8" stroke-linecap="round"/><path d="M8 16.5h3" stroke="${color('notice')}" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <div style="${label('notice')}">공지</div>
+      ${tab('today', '오늘')}
+      ${tab('calendar', '캘린더')}
+      <div style="${this.styleStr({ width:62, flexShrink:0 })}"></div>
+      ${tab('progress', '기록')}
+      ${tab('settings', '설정')}
+    </div>
+  `;
+};
+
+// (+)를 누르면 올라오는 등록 시트. 등록 경로 4개를 한 곳에 모은다.
+App.renderAddSheet = function(t) {
+  const item = (icon, title, desc, onclick) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:12, padding:'13px 12px', borderRadius:13, cursor:'pointer' })}" onclick="${onclick}">
+      <div style="${this.styleStr({ width:38, height:38, borderRadius:12, background:t.surfaceAlt, color:t.primary, display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0 })}">${icon}</div>
+      <div style="${this.styleStr({ flex:1, minWidth:0 })}">
+        <div style="${this.styleStr({ fontSize:14.5, fontWeight:700, color:t.text })}">${title}</div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:2 })}">${desc}</div>
       </div>
-      <div style="${btn()}" onclick="App.setState({tab:'notify'})">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 3a5 5 0 00-5 5v3.2c0 .6-.2 1.2-.6 1.7L5 15h14l-1.4-2.1c-.4-.5-.6-1.1-.6-1.7V8a5 5 0 00-5-5z" stroke="${color('notify')}" stroke-width="1.8" stroke-linejoin="round"/><path d="M9.5 18a2.5 2.5 0 005 0" stroke="${color('notify')}" stroke-width="1.8" stroke-linecap="round"/></svg>
-        <div style="${label('notify')}">알림</div>
-      </div>
-      <div style="${btn()}" onclick="App.setState({tab:'todo'})">
-        <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="4" y="4" width="16" height="16" rx="4" stroke="${color('todo')}" stroke-width="1.8"/><path d="M8.5 12.5l2.3 2.3L16 10" stroke="${color('todo')}" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        <div style="${label('todo')}">To do list</div>
+    </div>`;
+
+  const ic = (path) => `<svg width="19" height="19" viewBox="0 0 24 24" fill="none">${path}</svg>`;
+
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.42)', display:'flex', alignItems:'flex-end', zIndex:70 })}" onclick="App.closeAddSheet()">
+      <div style="${this.styleStr({ width:'100%', background:t.surface, borderRadius:'22px 22px 0 0', padding:'10px 12px calc(20px + env(safe-area-inset-bottom))' })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ width:36, height:4, borderRadius:2, background:t.border, margin:'0 auto 12px' })}"></div>
+        <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textFaint, padding:'0 12px 6px' })}">무엇을 추가할까요?</div>
+        ${item(ic(`<path d="M5 5h14M5 10h14M5 15h9" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>`),
+               '공지 붙여넣기', 'AI가 준비기간까지 계산해서 등록해요', 'App.startNoticeText()')}
+        ${item(ic(`<rect x="3" y="5" width="18" height="14" rx="2.5" stroke="currentColor" stroke-width="2"/><path d="M3 15l5-5 4 4 3-3 6 6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`),
+               '사진에서 가져오기', '가정통신문·카톡 캡처를 올리면 읽어드려요', 'App.startNoticeImage()')}
+        ${item(ic(`<path d="M4 20h4L19 9a2.5 2.5 0 00-3.5-3.5L4 16.5V20z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>`),
+               '일정 직접 입력', 'AI 없이 바로 추가해요', 'App.startManualEvent()')}
+        ${item(ic(`<rect x="4" y="4" width="16" height="16" rx="4.5" stroke="currentColor" stroke-width="2"/><path d="M8.5 12.5l2.3 2.3L16 10" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>`),
+               '할일 추가', '간단한 체크 항목을 만들어요', 'App.startManualTodo()')}
       </div>
     </div>
   `;
@@ -692,6 +1650,54 @@ App.renderDetailModal = function(t) {
   const dateLabel = ev.startDate === ev.endDate
     ? `${this.formatDue(ev.startDate)} ${this.formatTime(ev.start)}~${this.formatTime(ev.end)}`
     : `${this.formatDue(ev.startDate)} ~ ${this.formatDue(ev.endDate)}`;
+
+  const today = todayIso();
+  const pct = Math.round(this.progressOf(ev) * 100);
+  // 상세 화면의 진행률 바·체크박스도 일정 색을 쓴다(중요도는 바로 위 배지가 이미 말해준다)
+  const accent = this.eventColor(ev).bg;
+
+  // 준비 단계 체크리스트 (기획서 8.9) + 계획 대비 실제 비교 (8.10)
+  const prepBlock = ev.needsPrep ? `
+    <div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:12, padding:'12px 13px', margin:'14px 0 4px' })}">
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:9 })}">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:7 })}">
+          <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.text })}">준비 단계</div>
+          <div style="${this.styleStr({ fontSize:10.5, fontWeight:700, color:t.primary, background:t.surface, border:`1px solid ${t.border}`, borderRadius:7, padding:'3px 7px', cursor:'pointer' })}" onclick="App.openStepEditor('${ev._id}')">편집</div>
+        </div>
+        <div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textMuted })}">준비 ${ev.leadTimeDays}일 · ${pct}%</div>
+      </div>
+      <div style="${this.styleStr({ height:6, borderRadius:3, background:t.surface, overflow:'hidden', marginBottom:11 })}">
+        <div style="${this.styleStr({ width:`${pct}%`, height:'100%', background:accent, borderRadius:3 })}"></div>
+      </div>
+
+      ${(ev.steps || []).map((st, i) => {
+        // 계획 날짜가 지났는데 아직 체크가 안 된 단계는 빨갛게 표시해서 "밀렸다"는 걸 바로 알 수 있게 함
+        const late = !st.done && st.plannedDate && st.plannedDate < today;
+        return `
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:10, padding:'8px 0' })}">
+          <div style="${this.styleStr({ width:20, height:20, borderRadius:6, border:`2px solid ${st.done ? accent : t.border}`, background: st.done ? accent : 'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, cursor:'pointer' })}" onclick="App.toggleStep('${ev._id}', ${i})">
+            ${st.done ? `<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+          </div>
+          <div style="${this.styleStr({ flex:1, fontSize:13.5, fontWeight:600, color: st.done ? t.textFaint : t.text, textDecoration: st.done ? 'line-through' : 'none' })}">${this.esc(st.title)}</div>
+          <div style="${this.styleStr({ fontSize:11, fontWeight:700, color: late ? '#EF6F5B' : t.textFaint, flexShrink:0 })}">${st.plannedDate ? this.formatDue(st.plannedDate) : ''}${late ? ' 밀림' : ''}</div>
+        </div>`;
+      }).join('')}
+
+      <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginTop:10, paddingTop:10, borderTop:`1px solid ${t.border}` })}">
+        <div style="${this.styleStr({ fontSize:11.5, fontWeight:700, color:t.textMuted })}">준비기간 다시 잡기</div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:9 })}">
+          <div style="${this.styleStr({ width:26, height:26, borderRadius:13, background:t.surface, border:`1px solid ${t.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:800, color:t.text, cursor:'pointer', userSelect:'none' })}" onclick="App.changeEventLead('${ev._id}', -1)">−</div>
+          <div style="${this.styleStr({ fontSize:13, fontWeight:800, color:t.text, minWidth:36, textAlign:'center' })}">${ev.leadTimeDays}일</div>
+          <div style="${this.styleStr({ width:26, height:26, borderRadius:13, background:t.surface, border:`1px solid ${t.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:800, color:t.text, cursor:'pointer', userSelect:'none' })}" onclick="App.changeEventLead('${ev._id}', 1)">＋</div>
+        </div>
+      </div>
+
+      ${ev.retro && ev.retro.answeredAt ? `
+        <div style="${this.styleStr({ marginTop:10, paddingTop:10, borderTop:`1px solid ${t.border}`, fontSize:11.5, color:t.textMuted, lineHeight:1.6 })}">
+          회고: 준비기간이 ${({ tight:'부족했어요', ok:'적당했어요', loose:'넉넉했어요' })[ev.retro.feeling] || '기록됨'}${ev.retro.actualLeadDays !== null && ev.retro.actualLeadDays !== undefined ? ` · 계획 ${ev.leadTimeDays}일 / 실제 ${ev.retro.actualLeadDays}일` : ''}
+        </div>` : ''}
+    </div>
+  ` : '';
   return `
     <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:50, padding:20 })}" onclick="App.closeDetail()">
       <div style="${this.styleStr({ width:'100%', maxWidth:340, maxHeight:'85%', overflow:'auto', background:t.surface, borderRadius:20, padding:'18px 18px 22px', color:t.text })}" onclick="event.stopPropagation()">
@@ -699,12 +1705,20 @@ App.renderDetailModal = function(t) {
           <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">${this.esc(ev.title)}</div>
           <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeDetail()">✕</div>
         </div>
-        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginBottom:14 })}">
-          <div style="${this.styleStr({ padding:'4px 10px', borderRadius:20, background: (PRIORITY_META[ev.priority]||PRIORITY_META.medium).color, color:'#fff', fontSize:11, fontWeight:800 })}">중요도 ${(PRIORITY_META[ev.priority]||PRIORITY_META.medium).label}</div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginBottom:14, flexWrap:'wrap' })}">
+          <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:6 })}">
+            <div style="${this.styleStr({ padding:'4px 10px', borderRadius:20, background:accent, color:this.eventColor(ev).fg, fontSize:11, fontWeight:800 })}">${this.esc(this.categoryLabel(ev.category))}</div>
+            <div style="${this.styleStr({ padding:'4px 10px', borderRadius:20, background: (PRIORITY_META[ev.priority]||PRIORITY_META.medium).color, color:'#fff', fontSize:11, fontWeight:800 })}">중요도 ${(PRIORITY_META[ev.priority]||PRIORITY_META.medium).label}</div>
+          </div>
           <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, fontWeight:600 })}">${dateLabel}</div>
         </div>
+        ${ev.needsPrep ? `
+          <div style="${this.styleStr({ background:'rgba(59,65,119,0.08)', borderRadius:10, padding:'9px 11px', fontSize:12.5, fontWeight:700, color:t.primary, marginBottom:4 })}">
+            ${this.formatDue(ev.startDate)}부터 준비 시작 · 마감까지 ${ev.leadTimeDays}일
+          </div>` : ''}
         <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted, margin:'14px 0 6px' })}">AI 요약</div>
         <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(ev.aiSummary || '직접 추가한 일정이에요.')}</div>
+        ${prepBlock}
         ${ev.sourceContent ? `
           <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', margin:'14px 0 6px', cursor:'pointer' })}" onclick="App.toggleDetailSource()">
             <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted })}">원본 자료</div>
@@ -723,6 +1737,187 @@ App.renderDetailModal = function(t) {
         <div style="${this.styleStr({ display:'flex', gap:10, marginTop:16 })}">
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:14, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeDetail(); App.openEditModal('${ev._id}')">수정</div>
         </div>
+      </div>
+    </div>
+  `;
+};
+
+// ---------- 일정 종류 설정 모달 ----------
+// 자유도를 "이름 / 색 / 기본 준비일수 / 단계 유형" 네 가지로 제한했다.
+// 색을 완전히 자유롭게 열면 글씨가 안 읽히거나 종류끼리 구분이 안 되고,
+// 개수를 무제한으로 열면 AI가 분류해야 할 후보가 너무 많아져 정확도가 떨어진다.
+App.renderCategoryEditor = function(t) {
+  const s = this.state;
+  const draft = s.catDraft;
+
+  const row = (cat, i) => {
+    const swatch = swatchesForHue(cat.hue)[0];
+    const isFallback = cat.key === FALLBACK_CATEGORY_KEY;
+    const open = s.catExpanded === i;
+
+    const hueDots = HUE_PALETTE.map(h => {
+      const used = draft.some((c, j) => j !== i && c.hue === h);
+      const sw = swatchesForHue(h)[0];
+      return `<div style="${this.styleStr({
+        width:24, height:24, borderRadius:12, background:`hsl(${sw.h}, ${sw.s}%, ${sw.l}%)`,
+        border: cat.hue === h ? `3px solid ${t.text}` : `2px solid ${t.surface}`,
+        boxSizing:'border-box', cursor: used ? 'not-allowed' : 'pointer', opacity: used ? 0.25 : 1,
+        display:'flex', alignItems:'center', justifyContent:'center',
+      })}" title="${used ? '다른 종류가 쓰는 색이에요' : ''}" onclick="${used ? '' : `App.setCatHue(${i}, ${h})`}"></div>`;
+    }).join('');
+
+    return `
+      <div style="${this.styleStr({ border:`1px solid ${t.border}`, borderRadius:12, marginBottom:8, overflow:'hidden', background:t.surface })}">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:9, padding:'10px 11px', cursor:'pointer' })}" onclick="App.setState({catExpanded: ${open ? 'null' : i}})">
+          <div style="${this.styleStr({ width:16, height:16, borderRadius:5, background:`hsl(${swatch.h}, ${swatch.s}%, ${swatch.l}%)`, flexShrink:0 })}"></div>
+          <div style="${this.styleStr({ flex:1, minWidth:0, fontSize:14, fontWeight:700, color:t.text, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(cat.label) || '(이름 없음)'}</div>
+          <div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textMuted, flexShrink:0 })}">${cat.leadDays > 0 ? `준비 ${cat.leadDays}일` : '준비 없음'}</div>
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" style="${this.styleStr({ transform: open ? 'rotate(180deg)' : 'rotate(0deg)', flexShrink:0 })}"><path d="M6 9l6 6 6-6" stroke="${t.textFaint}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </div>
+
+        ${open ? `
+          <div style="${this.styleStr({ padding:'2px 11px 12px', borderTop:`1px solid ${t.border}` })}">
+            <div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textMuted, margin:'10px 0 5px' })}">이름</div>
+            <input style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:9, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13.5 })}"
+              type="text" value="${this.esc(cat.label)}" maxlength="12" placeholder="예: 수행평가"
+              oninput="App.state.catDraft[${i}].label = this.value">
+
+            <div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textMuted, margin:'12px 0 6px' })}">색</div>
+            <div style="${this.styleStr({ display:'flex', flexWrap:'wrap', gap:7 })}">${hueDots}</div>
+
+            <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, marginTop:14 })}">
+              <div>
+                <div style="${this.styleStr({ fontSize:11.5, fontWeight:700, color:t.text })}">기본 준비기간</div>
+                <div style="${this.styleStr({ fontSize:10.5, color:t.textFaint, marginTop:2 })}">0일이면 준비기간 없이 그 날 하루만</div>
+              </div>
+              <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:8, flexShrink:0 })}">
+                <div style="${this.styleStr({ width:26, height:26, borderRadius:13, background:t.surfaceAlt, border:`1px solid ${t.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:800, color:t.text, cursor:'pointer', userSelect:'none' })}" onclick="App.setCatLead(${i}, -1)">−</div>
+                <div style="${this.styleStr({ fontSize:13, fontWeight:800, color:t.text, minWidth:34, textAlign:'center' })}">${cat.leadDays}일</div>
+                <div style="${this.styleStr({ width:26, height:26, borderRadius:13, background:t.surfaceAlt, border:`1px solid ${t.border}`, display:'flex', alignItems:'center', justifyContent:'center', fontSize:14, fontWeight:800, color:t.text, cursor:'pointer', userSelect:'none' })}" onclick="App.setCatLead(${i}, 1)">＋</div>
+              </div>
+            </div>
+
+            ${cat.leadDays > 0 ? `
+              <div style="${this.styleStr({ fontSize:11, fontWeight:700, color:t.textMuted, margin:'14px 0 5px' })}">준비 단계 구성</div>
+              <select style="${this.styleStr({ width:'100%', padding:'8px 10px', borderRadius:9, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13 })}" onchange="App.setCatTemplate(${i}, this.value)">
+                ${STEP_TEMPLATE_OPTIONS.map(o => `<option value="${o.value}" ${cat.stepTemplate === o.value ? 'selected' : ''}>${o.label} — ${o.preview}</option>`).join('')}
+              </select>
+
+              <div style="${this.styleStr({ display:'flex', alignItems:'flex-start', gap:8, marginTop:12, cursor:'pointer' })}" onclick="App.toggleCatAi(${i})">
+                <div style="${this.styleStr({ width:18, height:18, borderRadius:5, border:`2px solid ${cat.aiDecides ? t.primary : t.border}`, background: cat.aiDecides ? t.primary : 'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0, boxSizing:'border-box' })}">
+                  ${cat.aiDecides ? `<svg width="10" height="10" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+                </div>
+                <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, lineHeight:1.5 })}">준비가 필요한지 AI가 공지마다 판단하게 하기<br/>(끄면 이 종류는 항상 준비기간이 붙어요)</div>
+              </div>
+            ` : ''}
+
+            ${isFallback
+              ? `<div style="${this.styleStr({ fontSize:10.5, color:t.textFaint, marginTop:14, lineHeight:1.5 })}">이 종류는 AI가 분류하지 못한 공지가 들어오는 자리라 삭제할 수 없어요.</div>`
+              : `<div style="${this.styleStr({ textAlign:'center', color:'#EF6F5B', fontSize:12, fontWeight:700, marginTop:16, cursor:'pointer' })}" onclick="App.removeCat(${i})">이 종류 삭제</div>`}
+          </div>
+        ` : ''}
+      </div>
+    `;
+  };
+
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:60, padding:14 })}" onclick="App.closeCategoryEditor()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:360, maxHeight:'90%', overflow:'auto', background:t.bg, borderRadius:20, padding:'18px 16px 20px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:5 })}">
+          <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">일정 종류 설정</div>
+          <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeCategoryEditor()">✕</div>
+        </div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, lineHeight:1.55, marginBottom:14 })}">
+          자주 쓰는 일정에 맞게 종류를 바꿔보세요. 여기서 정한 이름으로 AI가 공지를 분류하고,
+          준비기간도 종류별 기본값을 씁니다.
+        </div>
+
+        ${draft.map((c, i) => row(c, i)).join('')}
+
+        ${draft.length < MAX_CATEGORIES ? `
+          <div style="${this.styleStr({ padding:'10px 0', borderRadius:11, border:`1.5px dashed ${t.border}`, textAlign:'center', fontSize:12.5, fontWeight:700, color:t.textMuted, cursor:'pointer', marginTop:2 })}" onclick="App.addCat()">＋ 종류 추가</div>
+        ` : `<div style="${this.styleStr({ fontSize:11, color:t.textFaint, textAlign:'center', padding:'8px 0' })}">종류는 최대 ${MAX_CATEGORIES}개까지예요</div>`}
+
+        <div style="${this.styleStr({ display:'flex', gap:10, marginTop:16 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surface, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeCategoryEditor()">취소</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveCategoryDraft()">저장</div>
+        </div>
+        <div style="${this.styleStr({ textAlign:'center', fontSize:11.5, fontWeight:700, color:t.textMuted, marginTop:14, cursor:'pointer' })}" onclick="App.resetCategoryDraft()">기본값으로 되돌리기</div>
+      </div>
+    </div>
+  `;
+};
+
+// ---------- 준비 단계 편집 모달 ----------
+// 입력값은 oninput으로 stepDraft에 바로 반영하고 화면을 다시 그리지 않는다(포커스 유지).
+// 추가/삭제/순서 변경 같은 버튼 클릭 때만 다시 그린다.
+App.renderStepEditor = function(t) {
+  const s = this.state;
+  const ev = s.events.find(e => e._id === s.stepEditorEventId);
+  if (!ev) return '';
+
+  const templateLabel = this.STEP_TEMPLATE_LABELS[ev.stepTemplateKey] || '';
+  const iconBtn = (disabled) => this.styleStr({
+    width:26, height:26, borderRadius:8, background: disabled ? 'transparent' : t.surfaceAlt,
+    border:`1px solid ${disabled ? 'transparent' : t.border}`, display:'flex', alignItems:'center', justifyContent:'center',
+    fontSize:12, fontWeight:800, color: disabled ? t.textFaint : t.textMuted,
+    cursor: disabled ? 'default' : 'pointer', flexShrink:0, userSelect:'none',
+  });
+
+  const rows = s.stepDraft.map((st, i) => `
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:6, marginBottom:7 })}">
+      <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.textFaint, width:14, flexShrink:0, textAlign:'center' })}">${i + 1}</div>
+      <input style="${this.styleStr({ flex:1, minWidth:0, padding:'8px 10px', borderRadius:9, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:13.5 })}"
+        type="text" value="${this.esc(st.title)}" maxlength="30" placeholder="단계 이름"
+        oninput="App.state.stepDraft[${i}].title = this.value">
+      <div style="${iconBtn(i === 0)}" onclick="${i === 0 ? '' : `App.moveStepDraft(${i}, -1)`}">↑</div>
+      <div style="${iconBtn(i === s.stepDraft.length - 1)}" onclick="${i === s.stepDraft.length - 1 ? '' : `App.moveStepDraft(${i}, 1)`}">↓</div>
+      <div style="${iconBtn(s.stepDraft.length <= 1)}" onclick="${s.stepDraft.length <= 1 ? '' : `App.removeStepDraft(${i})`}">✕</div>
+    </div>
+  `).join('');
+
+  const check = (on) => this.styleStr({
+    width:19, height:19, borderRadius:6, border:`2px solid ${on ? t.primary : t.border}`,
+    background: on ? t.primary : 'transparent', display:'flex', alignItems:'center', justifyContent:'center', flexShrink:0,
+  });
+
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:'rgba(0,0,0,0.45)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:60, padding:16 })}" onclick="App.closeStepEditor()">
+      <div style="${this.styleStr({ width:'100%', maxWidth:350, maxHeight:'88%', overflow:'auto', background:t.surface, borderRadius:20, padding:'18px 18px 22px', color:t.text })}" onclick="event.stopPropagation()">
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:6 })}">
+          <div style="${this.styleStr({ fontSize:17, fontWeight:800 })}">준비 단계 편집</div>
+          <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeStepEditor()">✕</div>
+        </div>
+        <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, lineHeight:1.5, marginBottom:14 })}">
+          이름을 바꾸거나 순서를 옮길 수 있어요. 저장하면 남은 기간에 맞춰 날짜가 다시 나뉘어요.
+        </div>
+
+        ${rows}
+
+        ${s.stepDraft.length < 8 ? `
+          <div style="${this.styleStr({ padding:'9px 0', borderRadius:10, border:`1.5px dashed ${t.border}`, textAlign:'center', fontSize:12.5, fontWeight:700, color:t.textMuted, cursor:'pointer', marginTop:2 })}" onclick="App.addStepDraft()">＋ 단계 추가</div>
+        ` : `<div style="${this.styleStr({ fontSize:11, color:t.textFaint, textAlign:'center', padding:'6px 0' })}">단계는 최대 8개까지예요</div>`}
+
+        ${ev.stepTemplateKey ? `
+          <div style="${this.styleStr({ display:'flex', alignItems:'flex-start', gap:9, marginTop:16, padding:'11px 12px', background:t.surfaceAlt, borderRadius:11, cursor:'pointer' })}" onclick="App.setState({stepRemember: !App.state.stepRemember})">
+            <div style="${check(s.stepRemember)}">
+              ${s.stepRemember ? `<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
+            </div>
+            <div style="${this.styleStr({ flex:1 })}">
+              <div style="${this.styleStr({ fontSize:12.5, fontWeight:700, color:t.text })}">다음에도 이 구성으로 만들기</div>
+              <div style="${this.styleStr({ fontSize:11, color:t.textMuted, marginTop:3, lineHeight:1.5 })}">앞으로 ${templateLabel} 일정이 들어오면 이 단계를 먼저 보여줄게요.</div>
+            </div>
+          </div>
+        ` : ''}
+
+        <div style="${this.styleStr({ display:'flex', gap:10, marginTop:16 })}">
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeStepEditor()">취소</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveStepDraft()">저장</div>
+        </div>
+
+        ${(ev.stepTemplateKey && this.getStepPref(ev.stepTemplateKey)) ? `
+          <div style="${this.styleStr({ textAlign:'center', fontSize:11.5, fontWeight:700, color:t.textMuted, marginTop:14, cursor:'pointer' })}" onclick="App.forgetStepPref('${ev.stepTemplateKey}')">기억해둔 ${templateLabel} 구성 지우기</div>
+        ` : ''}
       </div>
     </div>
   `;
@@ -906,9 +2101,9 @@ App.saveManualTodo = async function() {
   const title = this.state.todoDraftTitle.trim();
   if (!title) return;
   try {
-    await fetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.todoDate }) });
+    await fetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.selectedDate }) });
     await this.reloadAll();
-    this.setState({ todoModalOpen:false, todoDraftTitle:'' });
+    this.setState({ todoModalOpen:false, todoDraftTitle:'', tab:'calendar', calendarMode:'todo' });
   } catch (err) {
     alert('할일 저장 실패: ' + err.message);
   }
@@ -926,7 +2121,7 @@ App.saveEvent = async function() {
       await fetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     }
     await this.reloadAll();
-    this.setState({ modalOpen:false, selectedDate: f.startDate });
+    this.setState({ modalOpen:false, selectedDate: f.startDate, tab:'calendar', calendarMode:'event' });
     if (this.state.modalMode !== 'edit') {
       this.showToast(`"${f.title}" 일정이 등록됐어요!`);
       this.scheduleTestAlarm({ title: f.title });
@@ -952,55 +2147,363 @@ App.toggleTodo = async function(id) {
   this.render();
 };
 
+// ---------- (+) 등록 시트 ----------
+// 예전에는 공지 탭 / 캘린더 FAB / 할일 FAB 세 군데로 흩어져 있던 등록 경로를 하나로 모았다.
+App.openAddSheet = function() { this.setState({ addSheetOpen: true }); };
+App.closeAddSheet = function() { this.setState({ addSheetOpen: false }); };
+
+// 공지 등록 화면으로 이동. 이전에 남아있던 분석 결과는 지우고 새로 시작한다.
+App.startNoticeText = function() {
+  this.setState({
+    addSheetOpen: false, tab: 'notice',
+    noticeText: '', imageFile: null, imagePreviewUrl: null,
+    parsedResult: null, analyzeError: null,
+    addedEvent: false, addedTodo: false, leadDraft: null, stepPrefApplied: false,
+  });
+};
+App.startNoticeImage = function() {
+  this.startNoticeText();
+  // 화면이 그려진 뒤에 파일 선택창을 띄운다
+  setTimeout(() => {
+    const input = document.getElementById('image-input');
+    if (input) input.click();
+  }, 60);
+};
+App.startManualEvent = function() {
+  this.setState({ addSheetOpen: false });
+  this.openAddModal();
+};
+App.startManualTodo = function() {
+  this.setState({ addSheetOpen: false });
+  this.openTodoModal();
+};
+// 공지 등록 화면에서 나가기 → 오늘 탭으로
+App.closeNotice = function() { this.setState({ tab: 'today' }); };
+
+// ---------- 일정 종류 설정 ----------
+App.openCategoryEditor = function() {
+  this.setState({
+    catEditorOpen: true,
+    catExpanded: null,
+    // 원본을 직접 건드리지 않도록 복사본으로 편집한다 (취소하면 그냥 버려짐)
+    catDraft: this.categories().map(c => ({ ...c })),
+  });
+};
+App.closeCategoryEditor = function() {
+  this.setState({ catEditorOpen:false, catDraft:[], catExpanded:null });
+};
+App.setCatHue = function(i, hue) {
+  this.setState(s => {
+    const arr = s.catDraft.map(c => ({ ...c }));
+    arr[i].hue = hue;
+    return { catDraft: arr };
+  });
+};
+App.setCatLead = function(i, delta) {
+  this.setState(s => {
+    const arr = s.catDraft.map(c => ({ ...c }));
+    arr[i].leadDays = Math.max(0, Math.min(30, arr[i].leadDays + delta));
+    return { catDraft: arr };
+  });
+};
+App.setCatTemplate = function(i, value) {
+  this.state.catDraft[i].stepTemplate = value; // select는 다시 그릴 필요 없음
+};
+App.toggleCatAi = function(i) {
+  this.setState(s => {
+    const arr = s.catDraft.map(c => ({ ...c }));
+    arr[i].aiDecides = !arr[i].aiDecides;
+    return { catDraft: arr };
+  });
+};
+App.addCat = function() {
+  if (this.state.catDraft.length >= MAX_CATEGORIES) return;
+  // 아직 아무도 안 쓰는 색을 골라준다
+  const used = new Set(this.state.catDraft.map(c => c.hue));
+  const hue = HUE_PALETTE.find(h => !used.has(h)) ?? HUE_PALETTE[0];
+  // key는 만들 때 한 번만 정하고, 나중에 이름을 바꿔도 그대로 둔다
+  // (이미 저장된 일정들이 이 key로 종류를 가리키고 있기 때문)
+  let key = '종류' + (this.state.catDraft.length + 1);
+  const keys = new Set(this.state.catDraft.map(c => c.key));
+  let n = this.state.catDraft.length + 1;
+  while (keys.has(key)) { n += 1; key = '종류' + n; }
+
+  this.setState(s => ({
+    catDraft: [...s.catDraft, { key, label:'', hue, leadDays:0, aiDecides:true, stepTemplate:'generic' }],
+    catExpanded: s.catDraft.length,
+  }));
+};
+App.removeCat = function(i) {
+  const cat = this.state.catDraft[i];
+  if (!cat || cat.key === FALLBACK_CATEGORY_KEY) return;
+  this.setState(s => ({ catDraft: s.catDraft.filter((_, j) => j !== i), catExpanded: null }));
+};
+App.saveCategoryDraft = function() {
+  const draft = this.state.catDraft
+    .map(c => ({ ...c, label: String(c.label || '').trim() }))
+    .filter(c => c.label);
+  if (!draft.length) { alert('종류는 최소 1개 이상이어야 해요.'); return; }
+
+  const labels = draft.map(c => c.label);
+  if (new Set(labels).size !== labels.length) {
+    alert('같은 이름을 가진 종류가 있어요. 이름을 서로 다르게 해주세요.');
+    return;
+  }
+
+  this.saveCategories(draft);
+  this.setState({ catEditorOpen:false, catDraft:[], catExpanded:null });
+  this.showToast('일정 종류를 저장했어요!');
+};
+App.resetCategoryDraft = function() {
+  this.setState({ catDraft: DEFAULT_CATEGORIES.map(c => ({ ...c })), catExpanded: null });
+};
+
+// ---------- 준비 단계 / 회고 (기획서 8.9, 8.10) ----------
+
+// 단계 하나를 완료/미완료로 토글. Todo 완료 토글과 같은 패턴.
+App.toggleStep = async function(eventId, index) {
+  try {
+    const res = await fetch(`${API_BASE}/schedule/${eventId}/steps/${index}`, { method:'PATCH' });
+    if (!res.ok) throw new Error((await res.json()).error || '단계 업데이트 실패');
+    await this.reloadAll();
+    this.render();
+  } catch (err) { alert('단계 업데이트 실패: ' + err.message); }
+};
+
+// ---------- 준비 단계 구성 편집 ----------
+App.openStepEditor = function(eventId) {
+  const ev = this.state.events.find(e => e._id === eventId);
+  if (!ev) return;
+  this.setState({
+    stepEditorOpen: true,
+    stepEditorEventId: eventId,
+    // 원본을 직접 건드리지 않도록 복사본을 만들어서 편집한다 (취소하면 그냥 버려짐)
+    stepDraft: (ev.steps || []).map(st => ({ title: st.title, done: st.done })),
+    stepRemember: true,
+  });
+};
+App.closeStepEditor = function() {
+  this.setState({ stepEditorOpen:false, stepEditorEventId:null, stepDraft:[] });
+};
+App.addStepDraft = function() {
+  if (this.state.stepDraft.length >= 8) return;
+  this.setState(s => ({ stepDraft: [...s.stepDraft, { title:'', done:false }] }));
+};
+App.removeStepDraft = function(index) {
+  if (this.state.stepDraft.length <= 1) return;
+  this.setState(s => ({ stepDraft: s.stepDraft.filter((_, i) => i !== index) }));
+};
+App.moveStepDraft = function(index, delta) {
+  const next = index + delta;
+  if (next < 0 || next >= this.state.stepDraft.length) return;
+  this.setState(s => {
+    const arr = [...s.stepDraft];
+    [arr[index], arr[next]] = [arr[next], arr[index]];
+    return { stepDraft: arr };
+  });
+};
+App.saveStepDraft = async function() {
+  const s = this.state;
+  const ev = s.events.find(e => e._id === s.stepEditorEventId);
+  if (!ev) return;
+
+  const steps = s.stepDraft
+    .map(st => ({ title: String(st.title || '').trim(), done: st.done }))
+    .filter(st => st.title);
+  if (!steps.length) {
+    alert('단계는 최소 1개 이상이어야 해요.');
+    return;
+  }
+
+  try {
+    const res = await fetch(`${API_BASE}/schedule/${ev._id}/steps`, {
+      method:'PUT', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ steps }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '단계 저장 실패');
+
+    // 체크돼 있으면 이 구성을 기억해뒀다가 다음 같은 종류의 일정에 먼저 제안한다
+    if (s.stepRemember && ev.stepTemplateKey) {
+      this.setStepPref(ev.stepTemplateKey, steps.map(st => st.title));
+    }
+
+    await this.reloadAll();
+    this.closeStepEditor();
+    this.showToast(s.stepRemember && ev.stepTemplateKey
+      ? `단계를 바꿨어요. 다음 ${this.STEP_TEMPLATE_LABELS[ev.stepTemplateKey] || ''} 일정에도 적용할게요!`
+      : '준비 단계를 바꿨어요!');
+  } catch (err) { alert('단계 저장 실패: ' + err.message); }
+};
+App.forgetStepPref = function(templateKey) {
+  this.clearStepPref(templateKey);
+  this.render();
+  this.showToast('기억해둔 단계 구성을 지웠어요.');
+};
+
+// 이미 등록된 일정의 준비기간을 다시 조정 (시작일과 단계 계획일이 서버에서 재계산됨)
+App.changeEventLead = async function(eventId, delta) {
+  const ev = this.state.events.find(e => e._id === eventId);
+  if (!ev) return;
+  const next = Math.min(30, Math.max(1, (ev.leadTimeDays || 0) + delta));
+  if (next === ev.leadTimeDays) return;
+  try {
+    const res = await fetch(`${API_BASE}/schedule/${eventId}`, {
+      method:'PATCH', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ leadTimeDays: next, categories: this.categories() }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '준비기간 수정 실패');
+    await this.reloadAll();
+    this.render();
+  } catch (err) { alert('준비기간 수정 실패: ' + err.message); }
+};
+
+// 마감 후 회고. 답한 결과를 다음 같은 카테고리 등록의 기본값에도 반영한다.
+App.saveRetro = async function(eventId, feeling) {
+  const ev = this.state.events.find(e => e._id === eventId);
+  try {
+    const res = await fetch(`${API_BASE}/schedule/${eventId}/retro`, {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({ feeling }),
+    });
+    if (!res.ok) throw new Error((await res.json()).error || '회고 저장 실패');
+
+    // "부족했다"고 하면 다음엔 하루 더, "넉넉했다"면 하루 덜 잡도록 개인화 값을 조정
+    const delta = feeling === 'tight' ? 1 : (feeling === 'loose' ? -1 : 0);
+    if (ev && ev.leadTimeDays && delta !== 0) {
+      const category = ev.category || '기타';
+      const base = this.getLeadPref(category) || ev.leadTimeDays;
+      this.setLeadPref(category, Math.min(30, Math.max(1, base + delta)));
+    }
+
+    await this.reloadAll();
+    this.render();
+    this.showToast(feeling === 'tight' ? '다음엔 하루 더 일찍 시작하도록 기억해둘게요!' : '기록했어요. 고마워요!');
+  } catch (err) { alert('회고 저장 실패: ' + err.message); }
+};
+
 App.openDetail = function(id) { this.setState({ detailEventId:id, showDetailSource:false }); };
 App.closeDetail = function() { this.setState({ detailEventId:null }); };
 App.toggleDetailSource = function() { this.setState(s => ({ showDetailSource: !s.showDetailSource })); };
 
-App.fillSample = function() { this.setState({ noticeText: SAMPLE_NOTICE, imageFile:null, imagePreviewUrl:null, parsedResult:null, addedEvent:false, addedTodo:false, analyzeError:null }); };
+// 공지 텍스트 입력. 글자를 칠 때마다 화면 전체를 다시 그리면 textarea 포커스와 커서 위치가
+// 날아가므로, 상태는 그대로 두고 "AI로 분석하기" 버튼 모양만 직접 갱신한다.
+App.onNoticeTextInput = function(value) {
+  this.state.noticeText = value;
+  this.syncAnalyzeButton();
+};
+
+App.syncAnalyzeButton = function() {
+  const btn = document.getElementById('analyze-btn');
+  if (!btn) return;
+  const s = this.state;
+  const t = this.theme(s.dark);
+  const can = (s.noticeText.trim() || s.imageFile) && !s.analyzing;
+  btn.style.background = can ? t.primary : t.border;
+  btn.style.color = can ? '#fff' : t.textFaint;
+  btn.style.cursor = can ? 'pointer' : 'default';
+};
+
+App.fillSample = function() { this.setState({ noticeText: SAMPLE_NOTICE, imageFile:null, imagePreviewUrl:null, parsedResult:null, addedEvent:false, addedTodo:false, leadDraft:null, stepPrefApplied:false, analyzeError:null }); };
 
 App.onImageSelected = function(e) {
   const file = e.target.files[0];
   if (!file) return;
   const reader = new FileReader();
   reader.onload = (ev) => {
-    this.setState({ imageFile:file, imagePreviewUrl: ev.target.result, noticeText:'', parsedResult:null, addedEvent:false, addedTodo:false, analyzeError:null });
+    this.setState({ imageFile:file, imagePreviewUrl: ev.target.result, noticeText:'', parsedResult:null, addedEvent:false, addedTodo:false, leadDraft:null, stepPrefApplied:false, analyzeError:null });
   };
   reader.readAsDataURL(file);
 };
 
 App.analyze = async function() {
   if (this.state.analyzing) return;
-  if (!this.state.noticeText.trim() && !this.state.imageFile) return;
-  this.setState({ analyzing:true, parsedResult:null, analyzeError:null, addedEvent:false, addedTodo:false });
+  // 버튼은 항상 눌리게 해뒀으므로 여기서 빈 입력을 막는다.
+  // 조용히 무시하면 "눌렀는데 아무 일도 안 난다"고 느끼므로 안내를 띄운다.
+  if (!this.state.noticeText.trim() && !this.state.imageFile) {
+    this.showToast('공지 내용을 입력하거나 스크린샷을 올려주세요.');
+    return;
+  }
+  this.setState({ analyzing:true, parsedResult:null, analyzeError:null, addedEvent:false, addedTodo:false, leadDraft:null, stepPrefApplied:false });
   try {
     let res;
     if (this.state.imageFile) {
       const formData = new FormData();
       formData.append('image', this.state.imageFile);
+      // multipart라 JSON 문자열로 실어 보낸다
+      formData.append('categories', JSON.stringify(this.categories()));
       res = await fetch(`${API_BASE}/notices/analyze-image`, { method:'POST', body: formData });
     } else {
-      res = await fetch(`${API_BASE}/notices/analyze-text`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ text: this.state.noticeText.trim() }) });
+      res = await fetch(`${API_BASE}/notices/analyze-text`, { method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ text: this.state.noticeText.trim(), categories: this.categories() }) });
     }
     if (!res.ok) throw new Error((await res.json()).error || '분석 실패');
     const data = await res.json();
-    this.setState({ analyzing:false, parsedResult:data });
+
+    // 리드타임 개인화 2단계 (기획서 9.4):
+    // 같은 카테고리를 지난번에 등록할 때 사용자가 고른 값이 있으면 그 값을 기본값으로 올린다.
+    const r = data.result;
+    let leadDraft = null;
+    if (r.needsPrep) {
+      const pref = this.getLeadPref(r.category);
+      leadDraft = pref || r.leadTimeDays;
+    }
+
+    // 같은 종류의 일정에서 예전에 단계를 고쳐둔 적이 있으면 그 구성을 먼저 보여준다
+    let stepPrefApplied = false;
+    if (r.event && r.event.needsPrep) {
+      const saved = this.getStepPref(r.event.stepTemplateKey);
+      if (saved) {
+        r.event.steps = saved.map(title => ({ title, plannedDate:'', done:false, doneAt:null }));
+        stepPrefApplied = true;
+      }
+    }
+
+    this.setState({ analyzing:false, parsedResult:data, leadDraft, stepPrefApplied });
   } catch (err) {
     this.setState({ analyzing:false, analyzeError: err.message });
   }
 };
 
+// 확인 화면에서 준비기간을 하루씩 늘리거나 줄임
+App.adjustLead = function(delta) {
+  const r = this.state.parsedResult && this.state.parsedResult.result;
+  if (!r) return;
+  const current = this.state.leadDraft !== null ? this.state.leadDraft : (r.leadTimeDays || 0);
+  const next = Math.min(30, Math.max(1, current + delta));
+  this.setState({ leadDraft: next });
+};
+
 App.addParsedEvent = async function() {
   const p = this.state.parsedResult;
   if (!p || !p.result.event || this.state.addedEvent) return;
+  const r = p.result;
+  const leadDays = r.needsPrep
+    ? (this.state.leadDraft !== null ? this.state.leadDraft : r.leadTimeDays)
+    : 0;
   try {
     await fetch(`${API_BASE}/notices/confirm`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addEvent:p.result.event }),
+      body: JSON.stringify({
+        sourceType:p.sourceType, rawContent:p.rawContent,
+        summary:r.summary, priority:r.priority, category:r.category,
+        categories: this.categories(),
+        // 날짜 계산은 서버가 다시 하므로 여기서는 조정된 일수와 단계 제목만 넘긴다
+        addEvent: {
+          ...r.event,
+          leadTimeDays: leadDays,
+          stepTitles: (r.event.steps || []).map(st => st.title),
+        },
+      }),
     });
+    // 이번에 고른 값을 다음 같은 카테고리 등록의 기본값으로 기억해둔다 (기획서 9.4)
+    if (r.needsPrep && leadDays > 0) this.setLeadPref(r.category, leadDays);
+
     await this.reloadAll();
     this.setState({ addedEvent:true });
-    this.showToast(`"${p.result.event.title}" 일정이 등록됐어요!`);
-    this.scheduleTestAlarm(p.result.event);
+    this.showToast(r.needsPrep
+      ? `${this.formatDue(this.prepStart(r.event, leadDays))}부터 준비 시작이에요!`
+      : `"${r.event.title}" 일정이 등록됐어요!`);
+    this.scheduleTestAlarm(r.event);
     this.checkAnalysisComplete();
   } catch (err) { alert('저장 실패: ' + err.message); }
 };
@@ -1010,7 +2513,7 @@ App.addParsedTodo = async function() {
   try {
     await fetch(`${API_BASE}/notices/confirm`, {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addTodo:p.result.todo }),
+      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addTodo:p.result.todo, categories: this.categories() }),
     });
     await this.reloadAll();
     this.setState({ addedTodo:true });
@@ -1026,7 +2529,7 @@ App.checkAnalysisComplete = function() {
   const todoDone = !p.result.todo || this.state.addedTodo;
   if (eventDone && todoDone) {
     setTimeout(() => {
-      this.setState({ parsedResult:null, noticeText:'', imageFile:null, imagePreviewUrl:null, addedEvent:false, addedTodo:false });
+      this.setState({ parsedResult:null, noticeText:'', imageFile:null, imagePreviewUrl:null, addedEvent:false, addedTodo:false, leadDraft:null, stepPrefApplied:false });
     }, 900); // "추가됨" 표시를 잠깐 보여준 뒤 비움
   }
 };

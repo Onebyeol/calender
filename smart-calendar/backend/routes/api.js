@@ -6,6 +6,37 @@ const ScheduleEvent = require('../models/ScheduleEvent');
 const Todo = require('../models/Todo');
 const { analyzeTextNotice, analyzeImageNotice } = require('../services/geminiService');
 const { sendPushToAll } = require('../services/pushService');
+const {
+  todayIso,
+  diffDays,
+  resolveLeadTime,
+  resolveUserLeadTime,
+  applyLeadTime,
+  calcProgress,
+  distributeSteps,
+  normalizeCategories,
+  buildRules,
+  FALLBACK_KEY,
+} = require('../services/leadTimeService');
+
+// 요청에 실려온 "일정 종류 설정"을 한 번에 풀어놓는다.
+// 종류는 사용자가 추가/삭제/이름변경할 수 있으므로 개수가 고정돼 있지 않다.
+//   labels : Gemini 프롬프트에 넣을 분류 후보 이름들 (개수가 그때그때 다름)
+//   toKey  : AI가 돌려준 이름(사용자 라벨)을 내부 키로 되돌리는 함수
+//   rules  : 종류별 리드타임 규칙표
+// 설정을 안 보내는 경로(iOS 단축어 등)는 기본 6종으로 자동 대체된다.
+function categoryContext(categories) {
+  const list = normalizeCategories(categories);
+  const toKey = new Map();
+  list.forEach((c) => { toKey.set(c.label, c.key); toKey.set(c.key, c.key); });
+  const fallback = list.some((c) => c.key === FALLBACK_KEY) ? FALLBACK_KEY : list[list.length - 1].key;
+  return {
+    list,
+    labels: list.map((c) => c.label),
+    rules: buildRules(list),
+    toKey: (v) => toKey.get(String(v ?? '').trim()) || fallback,
+  };
+}
 
 const router = express.Router();
 
@@ -17,9 +48,14 @@ const upload = multer({
 
 // 일정이 하나 생성될 때마다 호출: 즉시 등록 알림 1번 + (테스트용) 1분 뒤 알람 1번을 푸시로 보냄
 function notifyEventCreated(event) {
+  // 준비기간이 붙은 일정은 마감일이 아니라 "언제부터 시작하면 되는지"를 알려준다 (기획서의 핵심 메시지)
+  const body = event.needsPrep
+    ? `"${event.title}" — ${event.startDate}부터 준비 시작하면 돼요. (마감 ${event.endDate})`
+    : `"${event.title}" 일정이 캘린더에 추가됐어요.`;
+
   sendPushToAll({
-    title: '일정이 등록됐어요',
-    body: `"${event.title}" 일정이 캘린더에 추가됐어요.`,
+    title: event.needsPrep ? '준비 시작일을 잡았어요' : '일정이 등록됐어요',
+    body,
   }).catch((err) => console.error('[push] 등록 알림 실패:', err.message));
 
   setTimeout(() => {
@@ -31,12 +67,23 @@ function notifyEventCreated(event) {
 }
 
 // AI 분석 결과에서 프론트가 바로 쓸 수 있게 대표 이벤트/할일 1개씩만 뽑아서 정리
-function shapeParsed(parsed) {
+// + 준비기간(리드타임)을 역산해서 startDate를 앞으로 당기고 단계 체크리스트를 만든다 (기획서 8.4)
+function shapeParsed(parsed, ctx) {
+  const context = ctx || categoryContext(null);
   const event = (parsed.scheduleItems || [])[0];
   const todo = (parsed.todoItems || [])[0];
   const priority = parsed.priority || 'medium';
+  const category = parsed.category || FALLBACK_KEY;
 
-  const shapedEvent = event
+  // AI가 낸 needsPrep/suggestedLeadDays 초안을 종류별 규칙표로 보정한 최종값
+  const lead = resolveLeadTime({
+    category,
+    needsPrep: parsed.needsPrep,
+    suggestedLeadDays: parsed.suggestedLeadDays,
+    rules: context.rules,
+  });
+
+  let shapedEvent = event
     ? {
         title: event.title,
         startDate: event.startDate,
@@ -46,29 +93,56 @@ function shapeParsed(parsed) {
       }
     : null;
 
+  // 준비기간을 실제로 적용 (needsPrep이 false면 startDate는 그대로 유지됨)
+  if (shapedEvent) {
+    shapedEvent = applyLeadTime(shapedEvent, lead, category, { categories: context.list });
+  }
+
   let shapedTodo = todo ? { title: todo.title, due: todo.due || (event ? event.startDate : '') } : null;
 
   // 안전장치: 중요도가 high인데 AI가 todo를 안 만들었으면 여기서 자동으로 하나 만들어줌
   // (오늘 처리해야 할 일이 없다는 건 말이 안 되니까)
   if (!shapedTodo && priority === 'high') {
     shapedTodo = {
-      title: shapedEvent ? `${shapedEvent.title} 처리하기` : `${(parsed.category || '공지')} 확인하기`,
-      due: shapedEvent ? shapedEvent.startDate : todayIsoKST(),
+      title: shapedEvent ? `${shapedEvent.title} 처리하기` : `${category} 확인하기`,
+      // 준비기간이 붙은 일정이면 "마감일"이 아니라 "준비 시작일"이 오늘 해야 할 일의 기준이 된다
+      due: shapedEvent ? shapedEvent.startDate : todayIso(),
     };
   }
 
   return {
     summary: parsed.summary || '',
     priority,
-    category: parsed.category || '기타',
+    category,
     event: shapedEvent,
     todo: shapedTodo,
+    // 확인 화면에서 리드타임을 보여주고 조정하게 하려면 이벤트 밖에도 값이 필요함
+    needsPrep: lead.needsPrep,
+    leadTimeDays: lead.leadTimeDays,
+    leadTimeSource: lead.leadTimeSource,
   };
 }
 
-function todayIsoKST() {
-  const d = new Date();
-  return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
+// 확인(저장) 단계에서 사용자가 조정한 리드타임을 반영해 일정 필드를 다시 계산한다.
+// 계산 로직을 서버 한 곳에만 두려고, 프론트는 leadTimeDays 값만 보내고 날짜 계산은 여기서 한다.
+function buildEventFields(addEvent, category, priority, ctx) {
+  const context = ctx || categoryContext(null);
+  const base = {
+    title: addEvent.title,
+    startDate: addEvent.startDate,
+    endDate: addEvent.endDate || addEvent.startDate,
+    start: addEvent.start || '09:00',
+    end: addEvent.end || '10:00',
+    // 사용자가 준비기간을 늘렸다 줄였다 해도 항상 원래 마감 기준으로 다시 계산되도록
+    originalStartDate: addEvent.originalStartDate || addEvent.startDate,
+  };
+
+  const lead = addEvent.leadTimeDays !== undefined
+    ? resolveUserLeadTime({ category, leadTimeDays: addEvent.leadTimeDays, rules: context.rules })
+    : resolveLeadTime({ category, needsPrep: addEvent.needsPrep, suggestedLeadDays: addEvent.leadTimeDays, rules: context.rules });
+
+  // 사용자가 예전에 고쳐둔 단계 구성을 프론트가 같이 보내오면 표준 템플릿 대신 그걸 쓴다
+  return applyLeadTime(base, lead, category, { stepTitles: addEvent.stepTitles, categories: context.list });
 }
 
 // ---------- 1단계: 분석만 하고 저장은 안 함 (미리보기) ----------
@@ -80,8 +154,11 @@ router.post('/notices/analyze-text', async (req, res) => {
       return res.status(400).json({ error: '공지 텍스트가 비어있음' });
     }
 
-    const { parsed, rawContent } = await analyzeTextNotice(text.trim());
-    res.json({ sourceType: 'text', rawContent, result: shapeParsed(parsed) });
+    const ctx = categoryContext(req.body.categories);
+    const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
+    // AI는 사용자가 지은 이름으로 답하므로 내부 키로 되돌린다
+    parsed.category = ctx.toKey(parsed.category);
+    res.json({ sourceType: 'text', rawContent, result: shapeParsed(parsed, ctx) });
   } catch (err) {
     console.error('[POST /notices/analyze-text]', err);
     res.status(500).json({ error: '공지 분석 중 오류 발생', detail: err.message });
@@ -94,8 +171,13 @@ router.post('/notices/analyze-image', upload.single('image'), async (req, res) =
       return res.status(400).json({ error: '이미지 파일이 없음' });
     }
     const base64Image = req.file.buffer.toString('base64');
-    const { parsed, rawContent } = await analyzeImageNotice(base64Image, req.file.mimetype);
-    res.json({ sourceType: 'image', rawContent, result: shapeParsed(parsed) });
+    // multipart라 categories가 JSON 문자열로 들어온다
+    let categories = null;
+    try { categories = req.body.categories ? JSON.parse(req.body.categories) : null; } catch (e) { categories = null; }
+    const ctx = categoryContext(categories);
+    const { parsed, rawContent } = await analyzeImageNotice(base64Image, req.file.mimetype, ctx.labels);
+    parsed.category = ctx.toKey(parsed.category);
+    res.json({ sourceType: 'image', rawContent, result: shapeParsed(parsed, ctx) });
   } catch (err) {
     console.error('[POST /notices/analyze-image]', err);
     res.status(500).json({ error: '이미지 분석 중 오류 발생', detail: err.message });
@@ -112,25 +194,29 @@ router.post('/notices/confirm', async (req, res) => {
       return res.status(400).json({ error: 'sourceType/rawContent가 필요함' });
     }
 
+    const ctx = categoryContext(req.body.categories);
+    const cat = category || FALLBACK_KEY;
+    // 사용자가 확인 화면에서 조정했을 수 있으므로 여기서 준비기간을 최종 계산한다
+    const eventFields = addEvent ? buildEventFields(addEvent, cat, priority, ctx) : null;
+
     const notice = await Notice.create({
       sourceType,
       rawContent,
       summary: summary || '',
       priority: priority || 'medium',
-      category: category || '기타',
+      category: cat,
+      needsPrep: eventFields ? eventFields.needsPrep : false,
+      leadTimeDays: eventFields ? eventFields.leadTimeDays : 0,
     });
 
     let savedEvent = null;
     let savedTodo = null;
 
-    if (addEvent) {
+    if (eventFields) {
       savedEvent = await ScheduleEvent.create({
         noticeId: notice._id,
-        title: addEvent.title,
-        startDate: addEvent.startDate,
-        endDate: addEvent.endDate || addEvent.startDate,
-        start: addEvent.start || '09:00',
-        end: addEvent.end || '10:00',
+        ...eventFields,
+        category: cat,
         alarm: true,
         notify: true,
         priority: priority || 'medium',
@@ -171,18 +257,26 @@ router.get('/schedule', async (req, res) => {
 });
 
 // 수동으로 일정 추가 (+ 버튼)
+// 수동 추가에도 준비기간을 붙일 수 있게 leadTimeDays를 받는다 (안 보내면 예전처럼 단일 일정)
 router.post('/schedule', async (req, res) => {
   try {
-    const { title, startDate, endDate, start, end, alarm, notify, priority } = req.body;
+    const { title, startDate, endDate, start, end, alarm, notify, priority, leadTimeDays, category } = req.body;
     if (!title || !startDate) {
       return res.status(400).json({ error: 'title/startDate가 필요함' });
     }
+    const ctx = categoryContext(req.body.categories);
+    const cat = category || FALLBACK_KEY;
+    const lead = resolveUserLeadTime({ category: cat, leadTimeDays, rules: ctx.rules });
+    const fields = applyLeadTime(
+      { title, startDate, endDate: endDate || startDate, start: start || '09:00', end: end || '10:00' },
+      lead,
+      cat,
+      { categories: ctx.list }
+    );
+
     const event = await ScheduleEvent.create({
-      title,
-      startDate,
-      endDate: endDate || startDate,
-      start: start || '09:00',
-      end: end || '10:00',
+      ...fields,
+      category: cat,
       alarm: alarm !== undefined ? alarm : true,
       notify: notify !== undefined ? notify : true,
       priority: priority || 'medium',
@@ -197,19 +291,150 @@ router.post('/schedule', async (req, res) => {
 });
 
 // 일정 수정
+// leadTimeDays가 들어오면 원래 마감 기준으로 startDate와 단계 계획일을 다시 계산한다
 router.patch('/schedule/:id', async (req, res) => {
   try {
-    const fields = ['title', 'startDate', 'endDate', 'start', 'end', 'alarm', 'notify', 'priority'];
-    const update = {};
-    fields.forEach((f) => {
-      if (req.body[f] !== undefined) update[f] = req.body[f];
-    });
-    const event = await ScheduleEvent.findByIdAndUpdate(req.params.id, update, { new: true });
+    const event = await ScheduleEvent.findById(req.params.id);
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
+
+    const fields = ['title', 'startDate', 'endDate', 'start', 'end', 'alarm', 'notify', 'priority'];
+    fields.forEach((f) => {
+      if (req.body[f] !== undefined) event[f] = req.body[f];
+    });
+
+    if (req.body.leadTimeDays !== undefined) {
+      const ctx = categoryContext(req.body.categories);
+      const cat = req.body.category || event.category || FALLBACK_KEY;
+      const lead = resolveUserLeadTime({ category: cat, leadTimeDays: req.body.leadTimeDays, rules: ctx.rules });
+      // 사용자가 시작 날짜를 직접 고쳤다면 그 값을 새 기준일로 삼는다
+      const anchor = req.body.startDate !== undefined
+        ? req.body.startDate
+        : (event.originalStartDate || event.startDate);
+      // 사용자가 단계를 직접 고쳐뒀을 수 있으므로, 기간만 다시 잡고 단계 제목은 그대로 가져간다
+      const recalced = applyLeadTime(
+        { title: event.title, startDate: anchor, endDate: event.endDate, originalStartDate: anchor },
+        lead,
+        cat,
+        { stepTitles: event.steps.map((s) => s.title), categories: ctx.list }
+      );
+      event.startDate = recalced.startDate;
+      event.originalStartDate = recalced.originalStartDate;
+      event.needsPrep = recalced.needsPrep;
+      event.leadTimeDays = recalced.leadTimeDays;
+      event.leadTimeSource = recalced.leadTimeSource;
+      // 이미 체크해둔 단계가 있으면 완료 상태는 살리고 계획 날짜만 새로 배분한다
+      if (recalced.steps.length && event.steps.length === recalced.steps.length) {
+        recalced.steps.forEach((s, i) => {
+          s.done = event.steps[i].done;
+          s.doneAt = event.steps[i].doneAt;
+        });
+      }
+      event.steps = recalced.steps;
+    }
+
+    await event.save();
     res.json(event);
   } catch (err) {
     console.error('[PATCH /schedule/:id]', err);
     res.status(500).json({ error: '일정 수정 오류', detail: err.message });
+  }
+});
+
+// ---------- 준비 단계 체크리스트 (기획서 8.9) ----------
+// Todo의 완료 토글과 같은 패턴. 인덱스로 단계 하나를 뒤집는다.
+router.patch('/schedule/:id/steps/:index', async (req, res) => {
+  try {
+    const event = await ScheduleEvent.findById(req.params.id);
+    if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
+
+    const idx = Number(req.params.index);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= event.steps.length) {
+      return res.status(400).json({ error: '단계 번호가 올바르지 않음' });
+    }
+
+    const step = event.steps[idx];
+    step.done = !step.done;
+    step.doneAt = step.done ? new Date() : null;
+    await event.save();
+
+    res.json(event);
+  } catch (err) {
+    console.error('[PATCH /schedule/:id/steps/:index]', err);
+    res.status(500).json({ error: '단계 업데이트 오류', detail: err.message });
+  }
+});
+
+// ---------- 준비 단계 구성 자체를 바꾸기 (이름 수정 / 추가 / 삭제 / 순서 변경) ----------
+// 단계 목록 전체를 받아서 통째로 교체하고, 계획 날짜는 새 개수에 맞춰 다시 배분한다.
+// 완료 상태는 "제목이 그대로 남아있는 단계"만 유지한다(이름을 바꾸면 새 단계로 본다).
+router.put('/schedule/:id/steps', async (req, res) => {
+  try {
+    const event = await ScheduleEvent.findById(req.params.id);
+    if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
+
+    const incoming = Array.isArray(req.body.steps) ? req.body.steps : [];
+    const cleaned = incoming
+      .map((s) => ({ title: String(s?.title ?? '').trim().slice(0, 30), done: !!s?.done }))
+      .filter((s) => s.title)
+      .slice(0, 8);
+
+    if (cleaned.length === 0) {
+      return res.status(400).json({ error: '단계는 최소 1개 이상이어야 함' });
+    }
+
+    const prevByTitle = new Map(event.steps.map((s) => [s.title, s]));
+    const rebuilt = distributeSteps(cleaned.map((s) => s.title), event.startDate, event.endDate);
+    rebuilt.forEach((step, i) => {
+      if (!cleaned[i].done) return;
+      step.done = true;
+      const prev = prevByTitle.get(step.title);
+      step.doneAt = prev && prev.doneAt ? prev.doneAt : new Date();
+    });
+
+    event.steps = rebuilt;
+    await event.save();
+    res.json(event);
+  } catch (err) {
+    console.error('[PUT /schedule/:id/steps]', err);
+    res.status(500).json({ error: '단계 구성 저장 오류', detail: err.message });
+  }
+});
+
+// ---------- 마감 후 회고 (기획서 8.10) ----------
+// 계획된 시작일과 실제로 첫 단계를 체크한 날을 비교해서 "얼마나 늦게 시작했는지"를 같이 돌려준다.
+router.post('/schedule/:id/retro', async (req, res) => {
+  try {
+    const { feeling } = req.body;
+    if (!['tight', 'ok', 'loose'].includes(feeling)) {
+      return res.status(400).json({ error: 'feeling은 tight/ok/loose 중 하나여야 함' });
+    }
+
+    const event = await ScheduleEvent.findById(req.params.id);
+    if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
+
+    // 실제 준비 시작일 = 가장 먼저 체크한 단계의 완료 시각
+    const doneSteps = event.steps.filter((s) => s.done && s.doneAt);
+    let actualLeadDays = null;
+    if (doneSteps.length) {
+      const firstDone = doneSteps.reduce((a, b) => (a.doneAt < b.doneAt ? a : b));
+      const kst = new Date(firstDone.doneAt.getTime() + 9 * 60 * 60 * 1000);
+      const actualStart = `${kst.getUTCFullYear()}-${String(kst.getUTCMonth() + 1).padStart(2, '0')}-${String(kst.getUTCDate()).padStart(2, '0')}`;
+      actualLeadDays = Math.max(0, diffDays(actualStart, event.endDate));
+    }
+
+    event.retro = { answeredAt: new Date(), feeling, actualLeadDays };
+    await event.save();
+
+    res.json({
+      event,
+      // 프론트가 다음 등록 기본값을 조정할 때 쓰는 힌트
+      plannedLeadDays: event.leadTimeDays,
+      actualLeadDays,
+      delayDays: actualLeadDays === null ? null : event.leadTimeDays - actualLeadDays,
+    });
+  } catch (err) {
+    console.error('[POST /schedule/:id/retro]', err);
+    res.status(500).json({ error: '회고 저장 오류', detail: err.message });
   }
 });
 
@@ -265,6 +490,84 @@ router.patch('/todos/:id', async (req, res) => {
   }
 });
 
+// ---------- 일별 브리핑 (기획서 8.6 + 8.12) ----------
+// 정렬을 "임박도" 한 축이 아니라 "임박도 + 부담" 두 축으로 계산한다.
+//   임박도: 마감까지 남은 일수가 적을수록 높음
+//   부담  : 남은 준비 분량(1 - 진행률)을 남은 일수로 나눈 값. 준비가 밀려 있을수록 높음
+// 두 값 모두 이미 저장돼 있는 endDate / leadTimeDays / steps만으로 계산되므로 추가 입력이 없다.
+function scoreEvent(ev, today) {
+  const daysLeft = diffDays(today, ev.endDate);
+  const progress = calcProgress(ev.steps);
+
+  const urgency = Math.round(100 / (daysLeft + 1));
+  const load = ev.needsPrep
+    ? Math.round(((1 - progress) * ev.leadTimeDays * 30) / Math.max(1, daysLeft + 1))
+    : 0;
+  const priorityBonus = { high: 15, medium: 5, low: 0 }[ev.priority] ?? 5;
+
+  // 화면에 "왜 위에 있는지"를 한 줄로 설명해주기 위한 문구
+  let hint;
+  if (daysLeft === 0) hint = '오늘 마감이에요';
+  else if (daysLeft === 1) hint = '내일 마감이에요';
+  else if (ev.needsPrep && progress === 0) hint = `아직 시작 전이에요 · D-${daysLeft}`;
+  else if (ev.needsPrep && load >= urgency) hint = `준비가 밀렸어요 · D-${daysLeft}`;
+  else hint = `D-${daysLeft}`;
+
+  return {
+    ...ev.toObject(),
+    daysLeft,
+    progress,
+    urgency,
+    load,
+    score: urgency + load + priorityBonus,
+    hint,
+  };
+}
+
+router.get('/briefing', async (req, res) => {
+  try {
+    const today = req.query.date || todayIso();
+    const [events, todos] = await Promise.all([
+      ScheduleEvent.find(),
+      Todo.find({ done: false }),
+    ]);
+
+    // 오늘 신경 써야 하는 일정 = 준비 기간이나 일정 구간 안에 오늘이 들어있는 것
+    const active = events
+      .filter((ev) => ev.startDate <= today && today <= ev.endDate)
+      .map((ev) => scoreEvent(ev, today))
+      .sort((a, b) => b.score - a.score);
+
+    // 아직 시작 전이지만 3일 안에 준비를 시작해야 하는 일정 (미리 알려주는 용도)
+    const upcoming = events
+      .filter((ev) => ev.startDate > today && diffDays(today, ev.startDate) <= 3)
+      .map((ev) => ({ ...ev.toObject(), startsIn: diffDays(today, ev.startDate) }))
+      .sort((a, b) => a.startsIn - b.startsIn);
+
+    // 마감이 지났는데 회고를 아직 안 한 일정 (기획서 8.10)
+    const retroPending = events
+      .filter((ev) => ev.needsPrep && ev.endDate < today && !ev.retro?.answeredAt)
+      .sort((a, b) => b.endDate.localeCompare(a.endDate))
+      .slice(0, 3)
+      .map((ev) => ev.toObject());
+
+    const todayTodos = todos.filter((td) => td.due <= today);
+
+    res.json({
+      date: today,
+      // 그 주에 준비 기간이 몇 개나 겹쳐 있는지 = 이번 주 부담 (기획서 8.5의 숫자 버전)
+      overlapCount: active.filter((ev) => ev.needsPrep).length,
+      active,
+      upcoming,
+      retroPending,
+      todos: todayTodos,
+    });
+  } catch (err) {
+    console.error('[GET /briefing]', err);
+    res.status(500).json({ error: '브리핑 조회 오류', detail: err.message });
+  }
+});
+
 // ---------- 단축어 자동화 전용: 분석 + 저장을 한 번에 (앱 화면 없이 백그라운드 처리) ----------
 // 아이폰 "단축어" 앱에서 공유 시트로 텍스트를 받아 이 엔드포인트에 바로 POST하면,
 // 사용자가 앱을 열 필요 없이 AI가 알아서 일정/할일까지 저장해줌.
@@ -275,8 +578,11 @@ router.post('/notices/quick-add', async (req, res) => {
       return res.status(400).json({ error: '공지 텍스트가 비어있음' });
     }
 
-    const { parsed, rawContent } = await analyzeTextNotice(text.trim());
-    const shaped = shapeParsed(parsed);
+    // 단축어는 종류 설정을 못 보내므로 기본 6종으로 처리된다
+    const ctx = categoryContext(req.body.categories);
+    const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
+    parsed.category = ctx.toKey(parsed.category);
+    const shaped = shapeParsed(parsed, ctx);
 
     const notice = await Notice.create({
       sourceType: 'text',
@@ -284,19 +590,19 @@ router.post('/notices/quick-add', async (req, res) => {
       summary: shaped.summary,
       priority: shaped.priority,
       category: shaped.category,
+      needsPrep: shaped.needsPrep,
+      leadTimeDays: shaped.leadTimeDays,
     });
 
     let savedEvent = null;
     let savedTodo = null;
 
     if (shaped.event) {
+      // shapeParsed()에서 이미 준비기간이 반영된 상태(startDate 당겨짐 + steps 생성)라 그대로 저장
       savedEvent = await ScheduleEvent.create({
         noticeId: notice._id,
-        title: shaped.event.title,
-        startDate: shaped.event.startDate,
-        endDate: shaped.event.endDate,
-        start: shaped.event.start,
-        end: shaped.event.end,
+        ...shaped.event,
+        category: shaped.category,
         alarm: true,
         notify: true,
         priority: shaped.priority,
@@ -316,9 +622,16 @@ router.post('/notices/quick-add', async (req, res) => {
     }
 
     // 단축어의 "알림 표시" 동작에서 바로 쓰기 좋게 사람이 읽을 수 있는 메시지도 같이 반환
-    const message = savedEvent
-      ? `"${savedEvent.title}" 일정이 추가됐어요.`
-      : (savedTodo ? `"${savedTodo.title}" 할일이 추가됐어요.` : '분석은 했지만 캘린더에 추가할 일정/할일은 없었어요.');
+    let message;
+    if (savedEvent && savedEvent.needsPrep) {
+      message = `"${savedEvent.title}" — ${savedEvent.startDate}부터 준비 시작 (마감 ${savedEvent.endDate}, 준비 ${savedEvent.leadTimeDays}일)`;
+    } else if (savedEvent) {
+      message = `"${savedEvent.title}" 일정이 추가됐어요.`;
+    } else if (savedTodo) {
+      message = `"${savedTodo.title}" 할일이 추가됐어요.`;
+    } else {
+      message = '분석은 했지만 캘린더에 추가할 일정/할일은 없었어요.';
+    }
 
     res.status(201).json({ message, notice, event: savedEvent, todo: savedTodo });
   } catch (err) {
