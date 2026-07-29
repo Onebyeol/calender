@@ -16,7 +16,10 @@
       "text": "text",
       "url": "url",
       "files": [
-        { "name": "image", "accept": ["image/*"] }
+        {
+          "name": "image",
+          "accept": ["image/*", ".png", ".jpg", ".jpeg", ".webp", "text/plain"]
+        }
       ]
     }
   },

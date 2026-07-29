@@ -722,7 +722,7 @@ function receiveSharedImage(req, res, next) {
 }
 
 // Android PWA 공유 대상: 텍스트 또는 이미지를 곧바로 AI 분석·저장하고 앱으로 돌아간다.
-router.post('/notices/share-target', receiveSharedImage, async (req, res) => {
+async function handleSharedNotice(req, res) {
   const body = req.body || {};
   const sharedText = [...new Set(
     [body.title, body.text, body.url]
@@ -750,7 +750,12 @@ router.post('/notices/share-target', receiveSharedImage, async (req, res) => {
     console.error('[POST /notices/share-target]', err);
     return redirectShareError(res, 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.');
   }
-});
+}
+
+// 서비스워커가 아직 갱신되지 않은 설치본은 기존 경로로 직접 들어올 수 있어 유지한다.
+router.post('/notices/share-target', receiveSharedImage, handleSharedNotice);
+// 새 서비스워커는 Android의 원본 multipart를 읽어 다시 만든 뒤 이 경로로 전달한다.
+router.post('/notices/share-upload', receiveSharedImage, handleSharedNotice);
 
 // ---------- 웹 푸시 ----------
 
