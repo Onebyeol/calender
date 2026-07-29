@@ -27,11 +27,19 @@ self.addEventListener('fetch', (event) => {
         }
       }
 
-      return await fetch('/api/notices/share-upload', {
+      const uploadResponse = await fetch('/api/notices/share-upload?relay=1', {
         method: 'POST',
         body: outgoing,
         credentials: 'include',
       });
+      const result = await uploadResponse.json();
+      const query = new URLSearchParams({
+        shareStatus: result.shareStatus || (uploadResponse.ok ? 'success' : 'error'),
+        shareMessage: result.shareMessage || (uploadResponse.ok
+          ? '공유한 공지를 자동으로 등록했어요.'
+          : '공유한 공지를 자동 등록하지 못했어요.'),
+      });
+      return Response.redirect(`${self.location.origin}/?${query.toString()}`, 303);
     } catch (err) {
       const query = new URLSearchParams({
         shareStatus: 'error',

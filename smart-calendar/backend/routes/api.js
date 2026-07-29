@@ -659,12 +659,30 @@ router.post('/notices/quick-add', async (req, res) => {
   }
 });
 
-function redirectShareError(res, message) {
+function sendShareOutcome(req, res, status, message) {
+  // 서비스워커 중계 요청은 JSON을 받고 자신이 최종 앱 URL로 리다이렉트한다.
+  // 서버가 여기서 바로 리다이렉트하면 fetch가 HTML까지 따라간 뒤 action URL에 남을 수 있다.
+  if (req.query?.relay === '1') {
+    return res.status(status === 'success' ? 200 : 400).json({
+      shareStatus: status,
+      shareMessage: message,
+    });
+  }
+
   const query = new URLSearchParams({
-    shareStatus: 'error',
+    shareStatus: status,
     shareMessage: message,
   });
   return res.redirect(303, `/?${query.toString()}`);
+}
+
+function sharedTextFrom(source) {
+  const value = source || {};
+  return [...new Set(
+    [value.title, value.text, value.url]
+      .map((item) => String(item || '').trim())
+      .filter(Boolean)
+  )].join('\n\n');
 }
 
 function detectSharedImageMime(file) {
@@ -703,7 +721,7 @@ function receiveSharedImage(req, res, next) {
         : err.code === 'LIMIT_FILE_COUNT'
           ? '한 번에 공유한 이미지가 너무 많아요.'
           : '공유한 이미지를 읽지 못했어요.';
-      return redirectShareError(res, message);
+      return sendShareOutcome(req, res, 'error', message);
     }
 
     const files = Array.isArray(req.files) ? req.files : [];
@@ -715,7 +733,7 @@ function receiveSharedImage(req, res, next) {
     }) || null;
 
     if (files.length && !req.file) {
-      return redirectShareError(res, '지원하지 않는 이미지 형식이에요. PNG 또는 JPG로 다시 시도해주세요.');
+      return sendShareOutcome(req, res, 'error', '지원하지 않는 이미지 형식이에요. PNG 또는 JPG로 다시 시도해주세요.');
     }
     return next();
   });
@@ -723,34 +741,41 @@ function receiveSharedImage(req, res, next) {
 
 // Android PWA 공유 대상: 텍스트 또는 이미지를 곧바로 AI 분석·저장하고 앱으로 돌아간다.
 async function handleSharedNotice(req, res) {
-  const body = req.body || {};
-  const sharedText = [...new Set(
-    [body.title, body.text, body.url]
-      .map((value) => String(value || '').trim())
-      .filter(Boolean)
-  )].join('\n\n');
+  const sharedText = sharedTextFrom(req.body);
 
   if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
-    return redirectShareError(res, '이미지 파일만 공유할 수 있어요.');
+    return sendShareOutcome(req, res, 'error', '이미지 파일만 공유할 수 있어요.');
   }
   if (!req.file && !sharedText) {
-    return redirectShareError(res, '공유된 텍스트나 이미지가 없어 등록하지 못했어요.');
+    return sendShareOutcome(req, res, 'error', '공유된 텍스트나 이미지가 없어 등록하지 못했어요.');
   }
 
   try {
     const result = req.file
       ? await quickAddImageNotice(req.file)
       : await quickAddTextNotice(sharedText);
-    const query = new URLSearchParams({
-      shareStatus: 'success',
-      shareMessage: result.message,
-    });
-    return res.redirect(303, `/?${query.toString()}`);
+    return sendShareOutcome(req, res, 'success', result.message);
   } catch (err) {
     console.error('[POST /notices/share-target]', err);
-    return redirectShareError(res, 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.');
+    return sendShareOutcome(req, res, 'error', 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.');
   }
 }
+
+// 일부 Android/WebAPK는 설치 캐시나 호환성 문제로 action URL을 GET으로 다시 연다.
+// 원문이 쿼리에 있으면 텍스트 자동 등록을 수행하고, 없더라도 JSON 404 대신 앱으로 복귀시킨다.
+router.get('/notices/share-target', async (req, res) => {
+  const sharedText = sharedTextFrom(req.query);
+  if (!sharedText) {
+    return sendShareOutcome(req, res, 'error', '공유 데이터를 받지 못했어요. 앱을 다시 설치한 뒤 시도해주세요.');
+  }
+  try {
+    const result = await quickAddTextNotice(sharedText);
+    return sendShareOutcome(req, res, 'success', result.message);
+  } catch (err) {
+    console.error('[GET /notices/share-target]', err);
+    return sendShareOutcome(req, res, 'error', 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.');
+  }
+});
 
 // 서비스워커가 아직 갱신되지 않은 설치본은 기존 경로로 직접 들어올 수 있어 유지한다.
 router.post('/notices/share-target', receiveSharedImage, handleSharedNotice);
