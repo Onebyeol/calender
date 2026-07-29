@@ -570,15 +570,12 @@ router.get('/briefing', async (req, res) => {
 
 // ---------- 공유/단축어 자동화: 분석 + 저장을 한 번에 ----------
 // Android Web Share Target과 iOS 단축어가 같은 저장 로직을 공유한다.
-async function quickAddNotice(text, categories) {
-  // 공유 시트는 종류 설정을 못 보내므로 기본 6종으로 처리된다.
-  const ctx = categoryContext(categories);
-  const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
+async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx }) {
   parsed.category = ctx.toKey(parsed.category);
   const shaped = shapeParsed(parsed, ctx);
 
   const notice = await Notice.create({
-    sourceType: 'text',
+    sourceType,
     rawContent,
     summary: shaped.summary,
     priority: shaped.priority,
@@ -600,7 +597,7 @@ async function quickAddNotice(text, categories) {
       notify: true,
       priority: shaped.priority,
       aiSummary: shaped.summary,
-      sourceType: 'text',
+      sourceType,
       sourceContent: rawContent,
     });
     notifyEventCreated(savedEvent);
@@ -628,6 +625,20 @@ async function quickAddNotice(text, categories) {
   return { message, notice, event: savedEvent, todo: savedTodo };
 }
 
+async function quickAddTextNotice(text, categories) {
+  // 공유 시트는 종류 설정을 못 보내므로 기본 6종으로 처리된다.
+  const ctx = categoryContext(categories);
+  const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
+  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'text', ctx });
+}
+
+async function quickAddImageNotice(file, categories) {
+  const ctx = categoryContext(categories);
+  const base64Image = file.buffer.toString('base64');
+  const { parsed, rawContent } = await analyzeImageNotice(base64Image, file.mimetype, ctx.labels);
+  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'image', ctx });
+}
+
 // 아이폰 단축어용 JSON API
 router.post('/notices/quick-add', async (req, res) => {
   try {
@@ -636,7 +647,7 @@ router.post('/notices/quick-add', async (req, res) => {
       return res.status(400).json({ error: '공지 텍스트가 비어있음' });
     }
 
-    const result = await quickAddNotice(text, req.body.categories);
+    const result = await quickAddTextNotice(text, req.body.categories);
     res.status(201).json(result);
   } catch (err) {
     console.error('[POST /notices/quick-add]', err);
@@ -644,8 +655,27 @@ router.post('/notices/quick-add', async (req, res) => {
   }
 });
 
-// Android PWA 공유 대상: 폼으로 전달된 내용을 곧바로 AI 분석·저장하고 앱으로 돌아간다.
-router.post('/notices/share-target', async (req, res) => {
+function redirectShareError(res, message) {
+  const query = new URLSearchParams({
+    shareStatus: 'error',
+    shareMessage: message,
+  });
+  return res.redirect(303, `/?${query.toString()}`);
+}
+
+// Share Target의 multipart 폼/이미지를 파싱하고, 용량 오류도 앱 화면으로 돌려보낸다.
+function receiveSharedImage(req, res, next) {
+  upload.single('image')(req, res, (err) => {
+    if (!err) return next();
+    const message = err.code === 'LIMIT_FILE_SIZE'
+      ? '이미지는 8MB 이하만 공유할 수 있어요.'
+      : '공유한 이미지를 읽지 못했어요.';
+    return redirectShareError(res, message);
+  });
+}
+
+// Android PWA 공유 대상: 텍스트 또는 이미지를 곧바로 AI 분석·저장하고 앱으로 돌아간다.
+router.post('/notices/share-target', receiveSharedImage, async (req, res) => {
   const body = req.body || {};
   const sharedText = [...new Set(
     [body.title, body.text, body.url]
@@ -653,16 +683,17 @@ router.post('/notices/share-target', async (req, res) => {
       .filter(Boolean)
   )].join('\n\n');
 
-  if (!sharedText) {
-    const query = new URLSearchParams({
-      shareStatus: 'error',
-      shareMessage: '공유된 텍스트가 비어 있어 등록하지 못했어요.',
-    });
-    return res.redirect(303, `/?${query.toString()}`);
+  if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
+    return redirectShareError(res, '이미지 파일만 공유할 수 있어요.');
+  }
+  if (!req.file && !sharedText) {
+    return redirectShareError(res, '공유된 텍스트나 이미지가 없어 등록하지 못했어요.');
   }
 
   try {
-    const result = await quickAddNotice(sharedText);
+    const result = req.file
+      ? await quickAddImageNotice(req.file)
+      : await quickAddTextNotice(sharedText);
     const query = new URLSearchParams({
       shareStatus: 'success',
       shareMessage: result.message,
@@ -670,11 +701,7 @@ router.post('/notices/share-target', async (req, res) => {
     return res.redirect(303, `/?${query.toString()}`);
   } catch (err) {
     console.error('[POST /notices/share-target]', err);
-    const query = new URLSearchParams({
-      shareStatus: 'error',
-      shareMessage: 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.',
-    });
-    return res.redirect(303, `/?${query.toString()}`);
+    return redirectShareError(res, 'AI 자동 등록에 실패했어요. 잠시 후 다시 시도해주세요.');
   }
 });
 

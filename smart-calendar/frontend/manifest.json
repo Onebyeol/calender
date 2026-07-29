@@ -10,8 +10,15 @@
   "share_target": {
     "action": "/api/notices/share-target",
     "method": "POST",
-    "enctype": "application/x-www-form-urlencoded",
-    "params": { "title": "title", "text": "text", "url": "url" }
+    "enctype": "multipart/form-data",
+    "params": {
+      "title": "title",
+      "text": "text",
+      "url": "url",
+      "files": [
+        { "name": "image", "accept": ["image/*"] }
+      ]
+    }
   },
   "icons": [
     { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
