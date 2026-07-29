@@ -1,3 +1,9 @@
+// 새 공유 규칙이 오래된 서비스워커 뒤에서 대기하지 않도록 즉시 활성화한다.
+self.addEventListener('install', () => self.skipWaiting());
+self.addEventListener('activate', (event) => {
+  event.waitUntil(self.clients.claim());
+});
+
 // Android Web Share Target의 파일 POST는 서비스워커에서 먼저 formData로 읽은 뒤
 // 새 multipart 요청으로 서버에 전달한다. Android/WebAPK가 만든 원본 스트림을 서버로
 // 바로 넘길 때 일부 기기에서 "Unexpected end of form"이 나는 문제를 피하기 위함이다.
