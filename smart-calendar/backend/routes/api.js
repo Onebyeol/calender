@@ -213,14 +213,26 @@ router.post('/notices/analyze-image', upload.single('image'), async (req, res) =
 // ---------- 2단계: 사용자가 "캘린더에 추가"/"할일에 추가" 눌렀을 때만 저장 ----------
 // addEvent/addTodo 중 원하는 것만 body에 담아 보내면 그것만 저장됨
 
-router.post('/notices/confirm', async (req, res) => {
+router.post('/notices/confirm', upload.single('image'), async (req, res) => {
   try {
-    const { sourceType, rawContent, summary, priority, category, addEvent, addTodo } = req.body;
+    let payload = req.body;
+    if (req.body.payload) {
+      try {
+        payload = JSON.parse(req.body.payload);
+      } catch (err) {
+        return res.status(400).json({ error: '저장 요청 형식이 올바르지 않음' });
+      }
+    }
+
+    const { sourceType, rawContent, summary, priority, category, addEvent, addTodo } = payload;
     if (!sourceType || !rawContent) {
       return res.status(400).json({ error: 'sourceType/rawContent가 필요함' });
     }
+    if (req.file && !String(req.file.mimetype || '').startsWith('image/')) {
+      return res.status(400).json({ error: '이미지 파일만 원본으로 저장할 수 있음' });
+    }
 
-    const ctx = categoryContext(req.body.categories);
+    const ctx = categoryContext(payload.categories);
     const cat = category || FALLBACK_KEY;
     // 사용자가 확인 화면에서 조정했을 수 있으므로 여기서 준비기간을 최종 계산한다
     const eventFields = addEvent ? buildEventFields(addEvent, cat, priority, ctx) : null;
@@ -234,6 +246,8 @@ router.post('/notices/confirm', async (req, res) => {
       category: cat,
       needsPrep: eventFields ? eventFields.needsPrep : false,
       leadTimeDays: eventFields ? eventFields.leadTimeDays : 0,
+      imageData: sourceType === 'image' && req.file ? req.file.buffer : null,
+      imageMime: sourceType === 'image' && req.file ? req.file.mimetype : '',
     });
 
     let savedEvent = null;
@@ -268,6 +282,24 @@ router.post('/notices/confirm', async (req, res) => {
   } catch (err) {
     console.error('[POST /notices/confirm]', err);
     res.status(500).json({ error: '저장 중 오류 발생', detail: err.message });
+  }
+});
+
+// 원본 이미지는 상세 화면에서 펼칠 때만 인증된 요청으로 내려준다.
+router.get('/notices/:id/image', async (req, res) => {
+  try {
+    const notice = await Notice.findOne({ _id: req.params.id, ...ownerScope(req) })
+      .select('+imageData +imageMime');
+    if (!notice || !notice.imageData) {
+      return res.status(404).json({ error: '저장된 원본 이미지가 없음' });
+    }
+
+    res.set('Content-Type', notice.imageMime || 'application/octet-stream');
+    res.set('Cache-Control', 'private, max-age=3600');
+    return res.send(notice.imageData);
+  } catch (err) {
+    console.error('[GET /notices/:id/image]', err);
+    return res.status(500).json({ error: '원본 이미지 조회 오류', detail: err.message });
   }
 });
 
@@ -602,7 +634,15 @@ router.get('/briefing', async (req, res) => {
 
 // ---------- 공유/단축어 자동화: 분석 + 저장을 한 번에 ----------
 // Android Web Share Target과 iOS 단축어가 같은 저장 로직을 공유한다.
-async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx, userId }) {
+async function saveQuickAddAnalysis({
+  parsed,
+  rawContent,
+  sourceType,
+  ctx,
+  userId,
+  imageData = null,
+  imageMime = '',
+}) {
   parsed.category = ctx.toKey(parsed.category);
   const shaped = shapeParsed(parsed, ctx);
 
@@ -615,6 +655,8 @@ async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx, userI
     category: shaped.category,
     needsPrep: shaped.needsPrep,
     leadTimeDays: shaped.leadTimeDays,
+    imageData,
+    imageMime,
   });
 
   let savedEvent = null;
@@ -670,7 +712,15 @@ async function quickAddImageNotice(file, categories, userId = null) {
   const ctx = categoryContext(categories);
   const base64Image = file.buffer.toString('base64');
   const { parsed, rawContent } = await analyzeImageNotice(base64Image, file.mimetype, ctx.labels);
-  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'image', ctx, userId });
+  return saveQuickAddAnalysis({
+    parsed,
+    rawContent,
+    sourceType: 'image',
+    ctx,
+    userId,
+    imageData: file.buffer,
+    imageMime: file.mimetype,
+  });
 }
 
 // 아이폰 단축어용 JSON API

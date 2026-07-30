@@ -223,6 +223,9 @@ const App = {
     form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', notify: true, priority: 'medium' },
     detailEventId: null,
     showDetailSource: false,
+    detailSourceImageUrl: null,
+    detailSourceImageLoading: false,
+    detailSourceImageError: '',
 
     yearMonthModalOpen: false,
     draftYear: null,
@@ -1847,7 +1850,7 @@ App.renderDetailModal = function(t) {
         <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted, margin:'14px 0 6px' })}">AI 요약</div>
         <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(ev.aiSummary || '직접 추가한 일정이에요.')}</div>
         ${prepBlock}
-        ${ev.sourceContent ? `
+        ${(ev.sourceContent || (ev.sourceType === 'image' && ev.noticeId)) ? `
           <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', margin:'14px 0 6px', cursor:'pointer' })}" onclick="App.toggleDetailSource()">
             <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted })}">원본 자료</div>
             <svg width="10" height="10" viewBox="0 0 24 24" fill="none" style="${this.styleStr({ transform: s.showDetailSource ? 'rotate(180deg)' : 'rotate(0deg)', transition:'transform .15s' })}"><path d="M6 9l6 6 6-6" stroke="${t.textMuted}" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -1856,11 +1859,22 @@ App.renderDetailModal = function(t) {
         ${(s.showDetailSource && ev.sourceType === 'text' && ev.sourceContent) ? `
           <div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:12, padding:12, fontSize:12.5, lineHeight:1.6, color:t.text, whiteSpace:'pre-wrap', maxHeight:160, overflow:'auto' })}">${this.esc(ev.sourceContent)}</div>
         ` : ''}
-        ${(s.showDetailSource && ev.sourceType === 'image' && ev.sourceContent) ? `
-          <div style="${this.styleStr({ border:`1.5px dashed ${t.border}`, borderRadius:12, padding:'22px 12px', display:'flex', flexDirection:'column', alignItems:'center', gap:8, color:t.textMuted, fontSize:12, textAlign:'center' })}">
-            <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="${t.textMuted}" stroke-width="1.6"/><path d="M3 15l5-5 4 4 3-3 6 6" stroke="${t.textMuted}" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <div>${this.esc(ev.sourceContent)}</div>
+        ${(s.showDetailSource && ev.sourceType === 'image') ? `
+          <div style="${this.styleStr({ border:`1px solid ${t.border}`, background:t.surfaceAlt, borderRadius:12, padding:8, overflow:'hidden' })}">
+            ${s.detailSourceImageUrl ? `
+              <img src="${s.detailSourceImageUrl}" alt="원본 자료 이미지" onclick="App.openDetailSourceImage()" style="${this.styleStr({ display:'block', width:'100%', maxHeight:420, objectFit:'contain', borderRadius:8, cursor:'zoom-in' })}" />
+            ` : `
+              <div style="${this.styleStr({ minHeight:120, display:'flex', alignItems:'center', justifyContent:'center', padding:18, color:s.detailSourceImageError ? '#EF6F5B' : t.textMuted, fontSize:12.5, lineHeight:1.5, textAlign:'center' })}">
+                ${this.esc(s.detailSourceImageLoading ? '원본 이미지를 불러오는 중이에요…' : (s.detailSourceImageError || '원본 이미지를 불러올 수 없어요.'))}
+              </div>
+            `}
           </div>
+          ${ev.sourceContent ? `
+            <div style="${this.styleStr({ background:t.surfaceAlt, borderRadius:12, padding:12, marginTop:8, fontSize:12.5, lineHeight:1.6, color:t.text, whiteSpace:'pre-wrap', maxHeight:140, overflow:'auto' })}">
+              <div style="${this.styleStr({ fontSize:11, fontWeight:800, color:t.textMuted, marginBottom:5 })}">이미지에서 추출한 내용</div>
+              ${this.esc(ev.sourceContent)}
+            </div>
+          ` : ''}
         ` : ''}
         <div style="${this.styleStr({ display:'flex', gap:10, marginTop:16 })}">
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:14, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeDetail(); App.openEditModal('${ev._id}')">수정</div>
@@ -2629,9 +2643,72 @@ App.saveRetro = async function(eventId, feeling) {
   } catch (err) { alert('회고 저장 실패: ' + err.message); }
 };
 
-App.openDetail = function(id) { this.setState({ detailEventId:id, showDetailSource:false }); };
-App.closeDetail = function() { this.setState({ detailEventId:null }); };
-App.toggleDetailSource = function() { this.setState(s => ({ showDetailSource: !s.showDetailSource })); };
+App.releaseDetailSourceImage = function() {
+  if (this.state.detailSourceImageUrl) URL.revokeObjectURL(this.state.detailSourceImageUrl);
+};
+App.openDetail = function(id) {
+  this.releaseDetailSourceImage();
+  this.setState({
+    detailEventId:id,
+    showDetailSource:false,
+    detailSourceImageUrl:null,
+    detailSourceImageLoading:false,
+    detailSourceImageError:'',
+  });
+};
+App.closeDetail = function() {
+  this.releaseDetailSourceImage();
+  this.setState({
+    detailEventId:null,
+    showDetailSource:false,
+    detailSourceImageUrl:null,
+    detailSourceImageLoading:false,
+    detailSourceImageError:'',
+  });
+};
+App.toggleDetailSource = async function() {
+  const opening = !this.state.showDetailSource;
+  const eventId = this.state.detailEventId;
+  const ev = this.state.events.find(item => item._id === eventId);
+
+  if (!opening) {
+    this.setState({ showDetailSource:false });
+    return;
+  }
+
+  this.setState({ showDetailSource:true });
+  if (!ev || ev.sourceType !== 'image' || this.state.detailSourceImageUrl || this.state.detailSourceImageLoading) return;
+  if (!ev.noticeId) {
+    this.setState({ detailSourceImageError:'이 일정에는 연결된 원본 이미지가 없어요.' });
+    return;
+  }
+
+  this.setState({ detailSourceImageLoading:true, detailSourceImageError:'' });
+  try {
+    const res = await apiFetch(`${API_BASE}/notices/${ev.noticeId}/image`);
+    if (!res.ok) {
+      throw new Error(res.status === 404
+        ? '기존 일정에는 원본 이미지가 저장되어 있지 않아요.'
+        : '원본 이미지를 불러오지 못했어요.');
+    }
+    const url = URL.createObjectURL(await res.blob());
+    if (this.state.detailEventId !== eventId) {
+      URL.revokeObjectURL(url);
+      return;
+    }
+    this.releaseDetailSourceImage();
+    this.setState({ detailSourceImageUrl:url, detailSourceImageLoading:false, detailSourceImageError:'' });
+  } catch (err) {
+    if (this.state.detailEventId === eventId) {
+      this.setState({ detailSourceImageLoading:false, detailSourceImageError:err.message });
+    }
+  }
+};
+App.openDetailSourceImage = function() {
+  if (this.state.detailSourceImageUrl) {
+    window.open(this.state.detailSourceImageUrl, '_blank', 'noopener');
+  }
+};
 
 // 공지 텍스트 입력. 글자를 칠 때마다 화면 전체를 다시 그리면 textarea 포커스와 커서 위치가
 // 날아가므로, 상태는 그대로 두고 "AI로 분석하기" 버튼 모양만 직접 갱신한다.
@@ -2721,6 +2798,29 @@ App.adjustLead = function(delta) {
   this.setState({ leadDraft: next });
 };
 
+App.confirmParsed = async function(payload) {
+  let init;
+  if (payload.sourceType === 'image' && this.state.imageFile) {
+    const formData = new FormData();
+    formData.append('payload', JSON.stringify(payload));
+    formData.append('image', this.state.imageFile, this.state.imageFile.name || 'source-image');
+    init = { method:'POST', body:formData };
+  } else {
+    init = {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(payload),
+    };
+  }
+
+  const res = await apiFetch(`${API_BASE}/notices/confirm`, init);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error(body.error || '저장 실패');
+  }
+  return res.json();
+};
+
 App.addParsedEvent = async function() {
   const p = this.state.parsedResult;
   if (!p || !p.result.event || this.state.addedEvent) return;
@@ -2729,19 +2829,16 @@ App.addParsedEvent = async function() {
     ? (this.state.leadDraft !== null ? this.state.leadDraft : r.leadTimeDays)
     : 0;
   try {
-    await apiFetch(`${API_BASE}/notices/confirm`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({
-        sourceType:p.sourceType, rawContent:p.rawContent,
-        summary:r.summary, priority:r.priority, category:r.category,
-        categories: this.categories(),
-        // 날짜 계산은 서버가 다시 하므로 여기서는 조정된 일수와 단계 제목만 넘긴다
-        addEvent: {
-          ...r.event,
-          leadTimeDays: leadDays,
-          stepTitles: (r.event.steps || []).map(st => st.title),
-        },
-      }),
+    await this.confirmParsed({
+      sourceType:p.sourceType, rawContent:p.rawContent,
+      summary:r.summary, priority:r.priority, category:r.category,
+      categories: this.categories(),
+      // 날짜 계산은 서버가 다시 하므로 여기서는 조정된 일수와 단계 제목만 넘긴다
+      addEvent: {
+        ...r.event,
+        leadTimeDays: leadDays,
+        stepTitles: (r.event.steps || []).map(st => st.title),
+      },
     });
     // 이번에 고른 값을 다음 같은 카테고리 등록의 기본값으로 기억해둔다 (기획서 9.4)
     if (r.needsPrep && leadDays > 0) this.setLeadPref(r.category, leadDays);
@@ -2759,9 +2856,14 @@ App.addParsedTodo = async function() {
   const p = this.state.parsedResult;
   if (!p || !p.result.todo || this.state.addedTodo) return;
   try {
-    await apiFetch(`${API_BASE}/notices/confirm`, {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addTodo:p.result.todo, categories: this.categories() }),
+    await this.confirmParsed({
+      sourceType:p.sourceType,
+      rawContent:p.rawContent,
+      summary:p.result.summary,
+      priority:p.result.priority,
+      category:p.result.category,
+      addTodo:p.result.todo,
+      categories:this.categories(),
     });
     await this.reloadAll();
     this.setState({ addedTodo:true });

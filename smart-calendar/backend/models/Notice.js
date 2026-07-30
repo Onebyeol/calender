@@ -22,6 +22,17 @@ const noticeSchema = new mongoose.Schema(
       type: String,
       required: true,
     },
+    // 이미지 원본은 일정 목록에 싣지 않고 전용 API로 요청할 때만 읽는다.
+    imageData: {
+      type: Buffer,
+      default: null,
+      select: false,
+    },
+    imageMime: {
+      type: String,
+      default: '',
+      select: false,
+    },
     summary: {
       type: String,
       default: '',
