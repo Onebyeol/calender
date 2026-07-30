@@ -227,6 +227,7 @@ const App = {
 
     modalOpen: false,
     modalMode: 'add',
+    savingEvent: false, // 저장 요청이 나가있는 동안 true — 버튼 중복 클릭으로 일정이 2개 생기는 것을 막는다
     form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', notify: true, priority: 'medium', leadTimeDays:0, category:'' },
     modalReturnTab: null,
     detailEventId: null,
@@ -1796,7 +1797,7 @@ App.renderEventModal = function(t) {
         </div>
         <div style="${this.styleStr({ display:'flex', gap:10, marginTop:6 })}">
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.surfaceAlt, color:t.text, fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer', border:`1px solid ${t.border}` })}" onclick="App.closeModal()">취소</div>
-          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveEvent()">저장</div>
+          <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:s.savingEvent?t.border:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:s.savingEvent?'default':'pointer' })}" onclick="App.saveEvent()">${s.savingEvent ? '저장 중…' : '저장'}</div>
         </div>
         ${s.modalMode==='edit' ? `<div style="${this.styleStr({ textAlign:'center', color:'#EF6F5B', fontSize:13, fontWeight:700, marginTop:14, cursor:'pointer' })}" onclick="App.deleteEvent()">일정 삭제</div>` : ''}
       </div>
@@ -2436,18 +2437,26 @@ App.closeTodoModal = function() { this.setState({ todoModalOpen:false }); };
 App.saveManualTodo = async function() {
   const title = this.state.todoDraftTitle.trim();
   if (!title) return;
+  if (this._savingTodo) return; // 일정 저장과 같은 이유로 중복 요청을 막는다
+  this._savingTodo = true;
   try {
     await apiFetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.selectedDate }) });
     await this.reloadAll();
     this.setState({ todoModalOpen:false, todoDraftTitle:'', tab:'calendar', calendarMode:'todo' });
   } catch (err) {
     alert('할일 저장 실패: ' + err.message);
+  } finally {
+    this._savingTodo = false;
   }
 };
 
 App.saveEvent = async function() {
   const f = this.state.form;
   if (!f.title.trim()) return;
+  // 저장 버튼을 빠르게 두 번 누르면 첫 요청이 끝나기 전에 두 번째 요청이 나가서
+  // 같은 일정이 2개 만들어졌다. 요청이 끝날 때까지 두 번째 호출을 막는다.
+  if (this.state.savingEvent) return;
+  this.setState({ savingEvent: true });
   const wasEdit = this.state.modalMode === 'edit';
   const returnTab = this.state.modalReturnTab || this.state.tab;
   const endDate = f.endDate < f.startDate ? f.startDate : f.endDate;
@@ -2480,6 +2489,9 @@ App.saveEvent = async function() {
     }
   } catch (err) {
     alert('일정 저장 실패: ' + err.message);
+  } finally {
+    // 성공하면 모달이 닫히고, 실패하면 다시 누를 수 있어야 하므로 어느 쪽이든 잠금을 푼다
+    this.setState({ savingEvent: false });
   }
 };
 App.deleteEvent = async function() {
@@ -2947,6 +2959,9 @@ App.addParsedEvent = async function() {
   const leadDays = r.needsPrep
     ? (this.state.leadDraft !== null ? this.state.leadDraft : r.leadTimeDays)
     : 0;
+  // 저장이 끝난 뒤에 addedEvent를 켜면, 요청이 오가는 사이에 버튼을 한 번 더 누를 수 있어
+  // 같은 일정이 2개 만들어진다. 먼저 켜두고 실패하면 되돌린다.
+  this.setState({ addedEvent:true });
   try {
     await this.confirmParsed({
       sourceType:p.sourceType, rawContent:p.rawContent,
@@ -2963,17 +2978,21 @@ App.addParsedEvent = async function() {
     if (r.needsPrep && leadDays > 0) this.setLeadPref(r.category, leadDays);
 
     await this.reloadAll();
-    this.setState({ addedEvent:true });
     this.showToast(r.needsPrep
       ? `${this.formatDue(this.prepStart(r.event, leadDays))}부터 준비 시작이에요!`
       : `"${r.event.title}" 일정이 등록됐어요!`);
     this.scheduleTestAlarm(r.event);
     this.checkAnalysisComplete();
-  } catch (err) { alert('저장 실패: ' + err.message); }
+  } catch (err) {
+    this.setState({ addedEvent:false }); // 실패했으니 다시 누를 수 있게 되돌린다
+    alert('저장 실패: ' + err.message);
+  }
 };
 App.addParsedTodo = async function() {
   const p = this.state.parsedResult;
   if (!p || !p.result.todo || this.state.addedTodo) return;
+  // addParsedEvent와 같은 이유로 저장 전에 먼저 잠근다
+  this.setState({ addedTodo:true });
   try {
     await this.confirmParsed({
       sourceType:p.sourceType,
@@ -2985,9 +3004,11 @@ App.addParsedTodo = async function() {
       categories:this.categories(),
     });
     await this.reloadAll();
-    this.setState({ addedTodo:true });
     this.checkAnalysisComplete();
-  } catch (err) { alert('저장 실패: ' + err.message); }
+  } catch (err) {
+    this.setState({ addedTodo:false });
+    alert('저장 실패: ' + err.message);
+  }
 };
 // 필요한 항목(일정/할일)이 있으면 그게 다 추가됐는지 확인하고, 다 됐으면 분석 카드를 비워서
 // 사용자가 바로 다음 공지를 입력할 수 있게 함
