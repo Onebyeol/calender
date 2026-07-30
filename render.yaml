@@ -30,5 +30,6 @@ services:
         sync: false
       - key: VAPID_PRIVATE_KEY
         sync: false
+      # 푸시 서비스에 연락처로 전달되는 값. 운영하는 주소로 바꿔서 쓰면 된다.
       - key: VAPID_SUBJECT
-        value: mailto:hanbyeol677@gmail.com
+        sync: false
