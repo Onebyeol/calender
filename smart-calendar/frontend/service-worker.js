@@ -78,8 +78,8 @@ self.addEventListener('push', (event) => {
   event.waitUntil(
     self.registration.showNotification(data.title || '신박한 캘린더', {
       body: data.body || '',
-      icon: '/icon-192.png',
-      badge: '/icon-192.png',
+      icon: '/icon-192-transparent.png',
+      badge: '/icon-192-transparent.png',
       vibrate: [200, 100, 200], // 진동 (지원하는 기기에서)
       tag: 'sinbak-calendar', // 같은 tag면 알림이 쌓이지 않고 갱신됨
     })
