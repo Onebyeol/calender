@@ -15,7 +15,18 @@ app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 
 // 프론트엔드 정적 파일 서빙 (배포 시 별도 프론트 호스팅 없이 이 서버 하나로 시연 가능)
-app.use(express.static(path.join(__dirname, '..', 'frontend')));
+//
+// index.html과 서비스워커는 캐시하지 않는다.
+// 앱 코드가 전부 index.html 안에 들어있어서, 브라우저가 이 파일을 캐시해두면
+// 새로 배포해도 예전 화면이 계속 뜬다. 특히 iOS는 홈 화면에 추가한 PWA의 캐시를
+// 오래 붙들고 있어서, 이미 고친 버그가 그 기기에서만 계속 재현되는 일이 생긴다.
+app.use(express.static(path.join(__dirname, '..', 'frontend'), {
+  setHeaders: (res, filePath) => {
+    if (/index\.html$|service-worker\.js$/.test(filePath)) {
+      res.setHeader('Cache-Control', 'no-cache, must-revalidate');
+    }
+  },
+}));
 
 // Authorization 헤더가 있으면 req.userId를 채운다. 없으면 null(게스트)로 두고 그대로 진행한다.
 // 로그인하지 않아도 앱을 둘러보거나 공유 시트로 등록할 수 있어야 하므로 여기서 막지 않는다.

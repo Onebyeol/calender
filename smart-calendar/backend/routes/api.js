@@ -92,6 +92,68 @@ function notifyEventCreated(event) {
   }, 60 * 1000);
 }
 
+// ---------- 중복 저장 방지 ----------
+// 프론트에도 중복 클릭 잠금이 있지만, 그것만으로는 막을 수 없는 경우가 있다:
+//   - iOS Safari는 응답이 느리면(무료 플랜 콜드스타트 등) 같은 요청을 스스로 한 번 더 보낸다.
+//     이건 브라우저가 네트워크 계층에서 하는 재시도라 화면의 잠금과 무관하다.
+//   - 사용자의 기기가 예전 화면(캐시된 옛 JS)을 붙들고 있으면 그 잠금 자체가 없다.
+// 그래서 클라이언트를 믿지 않고 서버에서도 한 번 더 막는다.
+//
+// 같은 사용자가 "같은 제목 + 같은 마감일"의 일정을 아주 짧은 시간 안에 다시 만들면
+// 새로 만들지 않고 먼저 만들어진 것을 그대로 돌려준다.
+// 마감일(endDate)로 비교하는 이유: startDate는 준비기간에 따라 앞으로 당겨져서 값이 달라질 수 있다.
+const DUPLICATE_WINDOW_MS = 15 * 1000;
+
+function recentlyCreated() {
+  return { $gte: new Date(Date.now() - DUPLICATE_WINDOW_MS) };
+}
+
+async function findRecentDuplicateEvent(userId, title, endDate) {
+  if (!title || !endDate) return null;
+  return ScheduleEvent.findOne({
+    user: userId,
+    title,
+    endDate,
+    createdAt: recentlyCreated(),
+  }).sort({ createdAt: -1 });
+}
+
+/**
+ * 위의 사전 검사는 두 요청이 "거의 동시에" 들어오면 뚫린다.
+ * 둘 다 상대가 저장하기 전에 검사를 끝내버리기 때문이다.
+ * 그래서 만들고 난 뒤에 한 번 더 확인해서, 같은 일정이 이미 있으면 방금 만든 것을 지운다.
+ *
+ * 어느 쪽을 남길지는 _id로 정한다. ObjectId는 생성 시각 순으로 커지므로
+ * "가장 작은 _id만 살아남는다"는 규칙이면 두 요청이 서로를 지우는 일이 없다.
+ *
+ * @returns {Promise<object>} 살아남은 일정 (방금 만든 것이거나, 먼저 만들어져 있던 것)
+ */
+async function dropIfDuplicateEvent(event) {
+  const earlier = await ScheduleEvent.findOne({
+    user: event.user,
+    title: event.title,
+    endDate: event.endDate,
+    _id: { $lt: event._id },
+    createdAt: recentlyCreated(),
+  }).sort({ _id: 1 });
+
+  if (!earlier) return event;
+
+  await ScheduleEvent.deleteOne({ _id: event._id });
+  console.log(`[중복방지] "${event.title}" 일정이 동시에 두 번 저장돼서 하나를 지움`);
+  return earlier;
+}
+
+async function findRecentDuplicateTodo(userId, title, due) {
+  if (!title || !due) return null;
+  return Todo.findOne({
+    user: userId,
+    title,
+    due,
+    createdAt: recentlyCreated(),
+  }).sort({ createdAt: -1 });
+}
+
 // AI 분석 결과에서 프론트가 바로 쓸 수 있게 대표 이벤트/할일 1개씩만 뽑아서 정리
 // + 준비기간(리드타임)을 역산해서 startDate를 앞으로 당기고 단계 체크리스트를 만든다 (기획서 8.4)
 function shapeParsed(parsed, ctx) {
@@ -237,6 +299,19 @@ router.post('/notices/confirm', upload.single('image'), async (req, res) => {
     // 사용자가 확인 화면에서 조정했을 수 있으므로 여기서 준비기간을 최종 계산한다
     const eventFields = addEvent ? buildEventFields(addEvent, cat, priority, ctx) : null;
 
+    // 같은 일정/할일이 방금 저장됐다면 공지 레코드까지 새로 만들지 않고 그대로 돌려준다.
+    // (재시도로 들어온 요청이라 사용자가 한 번 더 누른 것이 아니다)
+    const dupEvent = eventFields
+      ? await findRecentDuplicateEvent(req.userId, eventFields.title, eventFields.endDate)
+      : null;
+    const dupTodo = (!eventFields && addTodo)
+      ? await findRecentDuplicateTodo(req.userId, addTodo.title, addTodo.due)
+      : null;
+    if (dupEvent || dupTodo) {
+      console.log('[중복방지] 방금 저장된 항목이라 새로 만들지 않음');
+      return res.status(200).json({ notice: null, event: dupEvent, todo: dupTodo });
+    }
+
     const notice = await Notice.create({
       user: req.userId,
       sourceType,
@@ -254,7 +329,7 @@ router.post('/notices/confirm', upload.single('image'), async (req, res) => {
     let savedTodo = null;
 
     if (eventFields) {
-      savedEvent = await ScheduleEvent.create({
+      const createdEvent = await ScheduleEvent.create({
         user: req.userId,
         noticeId: notice._id,
         ...eventFields,
@@ -265,7 +340,8 @@ router.post('/notices/confirm', upload.single('image'), async (req, res) => {
         sourceType,
         sourceContent: rawContent,
       });
-      notifyEventCreated(savedEvent);
+      savedEvent = await dropIfDuplicateEvent(createdEvent);
+      if (String(savedEvent._id) === String(createdEvent._id)) notifyEventCreated(savedEvent);
     }
 
     if (addTodo) {
@@ -334,7 +410,14 @@ router.post('/schedule', async (req, res) => {
       { categories: ctx.list }
     );
 
-    const event = await ScheduleEvent.create({
+    // 방금 만든 것과 같은 일정이면 새로 만들지 않고 그것을 그대로 돌려준다 (중복 저장 방지)
+    const duplicate = await findRecentDuplicateEvent(req.userId, fields.title, fields.endDate);
+    if (duplicate) {
+      console.log(`[중복방지] "${fields.title}" 일정이 방금 저장돼서 새로 만들지 않음`);
+      return res.status(200).json(duplicate);
+    }
+
+    const created = await ScheduleEvent.create({
       user: req.userId,
       ...fields,
       category: cat,
@@ -342,7 +425,11 @@ router.post('/schedule', async (req, res) => {
       priority: priority || 'medium',
       sourceType: 'manual',
     });
-    notifyEventCreated(event);
+
+    // 동시에 들어온 요청 때문에 두 개가 만들어졌다면 여기서 하나로 정리된다.
+    // 알림은 살아남은 일정에 대해 한 번만 보낸다.
+    const event = await dropIfDuplicateEvent(created);
+    if (String(event._id) === String(created._id)) notifyEventCreated(event);
     res.status(201).json(event);
   } catch (err) {
     console.error('[POST /schedule]', err);
@@ -568,6 +655,12 @@ router.post('/todos', async (req, res) => {
     if (!title || !due) {
       return res.status(400).json({ error: 'title/due가 필요함' });
     }
+    const duplicate = await findRecentDuplicateTodo(req.userId, title, due);
+    if (duplicate) {
+      console.log(`[중복방지] "${title}" 할일이 방금 저장돼서 새로 만들지 않음`);
+      return res.status(200).json(duplicate);
+    }
+
     const todo = await Todo.create({ user: req.userId, title, due, done: false });
     res.status(201).json(todo);
   } catch (err) {
