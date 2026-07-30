@@ -789,14 +789,16 @@ App.renderTopBar = function(t) {
         ? `<div style="${this.styleStr({ width:32, height:32, borderRadius:16, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer', flexShrink:0 })}" onclick="App.closeNotice()">
              <svg width="14" height="14" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.text}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
            </div>`
-        : this.renderAuthButton(t)}
-      <img src="logo-mark.png" alt="신박한 캘린더" style="${this.styleStr({ width:24, height:24, objectFit:'contain', flexShrink:0 })}" />
+        : `<img src="logo-mark.png" alt="신박한 캘린더" style="${this.styleStr({ width:26, height:26, objectFit:'contain', flexShrink:0 })}" />`}
       <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, letterSpacing:'-0.2px', fontFamily:"'Jua',sans-serif", whiteSpace:'nowrap' })}">${title}</div>
+      <!-- 남는 공간을 전부 밀어내서 로그인/로그아웃 버튼을 오른쪽 끝에 붙인다 -->
+      <div style="${this.styleStr({ flex:1 })}"></div>
+      ${isSubScreen ? '' : this.renderAuthButton(t)}
     </div>
   `;
 };
 
-// 상단 바 맨 왼쪽의 로그인/로그아웃 토글.
+// 상단 바 맨 오른쪽의 로그인/로그아웃 토글.
 // 로그아웃 상태 → "로그인"(누르면 로그인 화면), 로그인 상태 → "로그아웃"(누르면 바로 로그아웃).
 // 로그인한 계정 정보를 보고 싶으면 아이콘 쪽(아바타)을 길게 볼 필요 없이 설정 탭에서 확인한다.
 App.renderAuthButton = function(t) {
