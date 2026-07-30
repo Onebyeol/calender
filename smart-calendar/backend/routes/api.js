@@ -71,6 +71,9 @@ const upload = multer({
 // 일정이 하나 생성될 때마다 호출: 즉시 등록 알림 1번 + (테스트용) 1분 뒤 알람 1번을 푸시로 보냄
 // 알림은 그 일정을 만든 사용자의 기기에만 간다 (event.user가 null이면 게스트 기기들).
 function notifyEventCreated(event) {
+  // 사용자가 이 일정의 알림을 꺼두면 아무것도 보내지 않는다
+  if (!event.notify) return;
+
   // 준비기간이 붙은 일정은 마감일이 아니라 "언제부터 시작하면 되는지"를 알려준다 (기획서의 핵심 메시지)
   const body = event.needsPrep
     ? `"${event.title}" — ${event.startDate}부터 준비 시작하면 돼요. (마감 ${event.endDate})`
@@ -242,7 +245,6 @@ router.post('/notices/confirm', async (req, res) => {
         noticeId: notice._id,
         ...eventFields,
         category: cat,
-        alarm: true,
         notify: true,
         priority: priority || 'medium',
         aiSummary: summary || '',
@@ -286,7 +288,7 @@ router.get('/schedule', async (req, res) => {
 // 수동 추가에도 준비기간을 붙일 수 있게 leadTimeDays를 받는다 (안 보내면 예전처럼 단일 일정)
 router.post('/schedule', async (req, res) => {
   try {
-    const { title, startDate, endDate, start, end, alarm, notify, priority, leadTimeDays, category } = req.body;
+    const { title, startDate, endDate, start, end, notify, priority, leadTimeDays, category } = req.body;
     if (!title || !startDate) {
       return res.status(400).json({ error: 'title/startDate가 필요함' });
     }
@@ -304,7 +306,6 @@ router.post('/schedule', async (req, res) => {
       user: req.userId,
       ...fields,
       category: cat,
-      alarm: alarm !== undefined ? alarm : true,
       notify: notify !== undefined ? notify : true,
       priority: priority || 'medium',
       sourceType: 'manual',
@@ -325,7 +326,7 @@ router.patch('/schedule/:id', async (req, res) => {
     const event = await ScheduleEvent.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
 
-    const fields = ['title', 'startDate', 'endDate', 'start', 'end', 'alarm', 'notify', 'priority'];
+    const fields = ['title', 'startDate', 'endDate', 'start', 'end', 'notify', 'priority'];
     fields.forEach((f) => {
       if (req.body[f] !== undefined) event[f] = req.body[f];
     });
@@ -626,7 +627,6 @@ async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx, userI
       noticeId: notice._id,
       ...shaped.event,
       category: shaped.category,
-      alarm: true,
       notify: true,
       priority: shaped.priority,
       aiSummary: shaped.summary,

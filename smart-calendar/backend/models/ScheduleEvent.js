@@ -52,10 +52,10 @@ const scheduleEventSchema = new mongoose.Schema(
       type: String, // HH:mm
       default: '10:00',
     },
-    alarm: {
-      type: Boolean,
-      default: true,
-    },
+    // 이 일정에 대해 푸시 알림을 받을지.
+    // 예전에는 alarm/notify 두 개로 나뉘어 있었지만 둘 다 아무것도 제어하지 않는 값이었고,
+    // 화면에서도 "알람"과 "알림"이 구분되지 않아 하나로 합쳤다.
+    // 실제로 notifyEventCreated()가 이 값을 보고 발송 여부를 정한다.
     notify: {
       type: Boolean,
       default: true,

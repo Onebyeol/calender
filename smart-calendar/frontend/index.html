@@ -220,7 +220,7 @@ const App = {
 
     modalOpen: false,
     modalMode: 'add',
-    form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', alarm: true, notify: true, priority: 'medium' },
+    form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', notify: true, priority: 'medium' },
     detailEventId: null,
     showDetailSource: false,
 
@@ -1750,12 +1750,11 @@ App.renderEventModal = function(t) {
             ${['high','medium','low'].map(k => `<option value="${k}" ${f.priority===k?'selected':''}>${PRIORITY_META[k].label}</option>`).join('')}
           </select>
         </div>
-        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0' })}">
-          <div style="${this.styleStr({ fontSize:14.5, fontWeight:600, color:t.text })}">알람</div>
-          <div style="${track(f.alarm)}" onclick="App.state.form.alarm=!App.state.form.alarm; App.render()"><div style="${knob(f.alarm)}"></div></div>
-        </div>
-        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'6px 0' })}">
-          <div style="${this.styleStr({ fontSize:14.5, fontWeight:600, color:t.text })}">알림</div>
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, padding:'8px 0' })}">
+          <div style="${this.styleStr({ minWidth:0 })}">
+            <div style="${this.styleStr({ fontSize:14.5, fontWeight:600, color:t.text })}">이 일정 알림 받기</div>
+            <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:3, lineHeight:1.5 })}">${f.notify ? '준비를 시작할 날을 푸시로 알려드려요' : '이 일정은 알림을 보내지 않아요'}</div>
+          </div>
           <div style="${track(f.notify)}" onclick="App.state.form.notify=!App.state.form.notify; App.render()"><div style="${knob(f.notify)}"></div></div>
         </div>
         <div style="${this.styleStr({ display:'flex', gap:10, marginTop:6 })}">
@@ -2292,12 +2291,12 @@ App.prevMonth = function() { this.setState(s => { let m=s.viewMonth-1,y=s.viewYe
 App.nextMonth = function() { this.setState(s => { let m=s.viewMonth+1,y=s.viewYear; if(m>11){m=0;y++;} return {viewMonth:m, viewYear:y}; }); };
 
 App.openAddModal = function() {
-  this.setState({ modalOpen:true, modalMode:'add', form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', alarm:true, notify:true, priority:'medium' } });
+  this.setState({ modalOpen:true, modalMode:'add', form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', notify:true, priority:'medium' } });
 };
 App.openEditModal = function(id) {
   const ev = this.state.events.find(e => e._id === id);
   if (!ev) return;
-  this.setState({ modalOpen:true, modalMode:'edit', form:{ id: ev._id, title: ev.title, startDate: ev.startDate, endDate: ev.endDate, start: ev.start, end: ev.end, alarm: ev.alarm, notify: ev.notify, priority: ev.priority } });
+  this.setState({ modalOpen:true, modalMode:'edit', form:{ id: ev._id, title: ev.title, startDate: ev.startDate, endDate: ev.endDate, start: ev.start, end: ev.end, notify: ev.notify !== false, priority: ev.priority } });
 };
 App.closeModal = function() { this.setState({ modalOpen:false }); };
 
@@ -2319,7 +2318,7 @@ App.saveEvent = async function() {
   const f = this.state.form;
   if (!f.title.trim()) return;
   const endDate = f.endDate < f.startDate ? f.startDate : f.endDate;
-  const payload = { title:f.title, startDate:f.startDate, endDate, start:f.start, end:f.end, alarm:f.alarm, notify:f.notify, priority:f.priority };
+  const payload = { title:f.title, startDate:f.startDate, endDate, start:f.start, end:f.end, notify:f.notify, priority:f.priority };
   try {
     if (this.state.modalMode === 'edit') {
       await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
@@ -2330,7 +2329,8 @@ App.saveEvent = async function() {
     this.setState({ modalOpen:false, selectedDate: f.startDate, tab:'calendar', calendarMode:'event' });
     if (this.state.modalMode !== 'edit') {
       this.showToast(`"${f.title}" 일정이 등록됐어요!`);
-      this.scheduleTestAlarm({ title: f.title });
+      // 알림을 꺼둔 일정이면 화면 안 테스트 알람도 띄우지 않는다 (서버 푸시도 같은 값을 본다)
+      if (f.notify) this.scheduleTestAlarm({ title: f.title });
     }
   } catch (err) {
     alert('일정 저장 실패: ' + err.message);
