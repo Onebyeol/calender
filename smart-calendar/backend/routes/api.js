@@ -41,6 +41,23 @@ function categoryContext(categories) {
 
 const router = express.Router();
 
+// ---------- 로그인 필수 ----------
+// 이 라우터의 모든 경로는 로그인한 사용자만 쓸 수 있다.
+// (회원가입/로그인은 /api/auth 라우터라 이 검사에 걸리지 않는다)
+//
+// 예전에는 토큰이 없으면 "게스트 데이터"를 다루게 해뒀지만,
+// 로그인하지 않은 사람에게 남이 만든 일정이 그대로 보이는 문제가 있어서 막았다.
+router.use((req, res, next) => {
+  if (req.userId) return next();
+
+  // 공유 시트로 들어온 요청은 JSON 401을 띄워봐야 사용자가 볼 수 없다.
+  // 앱으로 돌려보내면서 무엇을 해야 하는지 토스트로 알려준다.
+  if (req.path.startsWith('/notices/share-')) {
+    return sendShareOutcome(req, res, 'error', '앱에서 먼저 로그인해주세요. 로그인한 뒤 다시 공유하면 자동으로 등록돼요.');
+  }
+  return res.status(401).json({ error: '로그인이 필요함' });
+});
+
 // 이미지는 메모리에만 잠깐 올렸다가 base64로 바로 Gemini에 넘기고 버림 (디스크 저장 안 함)
 const upload = multer({
   storage: multer.memoryStorage(),

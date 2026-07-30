@@ -57,7 +57,8 @@ const API_BASE = '/api';
 
 // ---------- 로그인 토큰 ----------
 // 로그인하면 서버가 준 JWT를 여기 저장해두고, 모든 API 요청에 Authorization 헤더로 붙인다.
-// 토큰이 없으면 헤더 없이 나가고, 서버는 그 요청을 "게스트"로 처리한다(로그인 없이 둘러보기).
+// localStorage에 남아있으므로 앱을 껐다 켜도 로그인이 유지된다(토큰 유효기간 30일).
+// 토큰이 없으면 서버가 401을 주고, 앱은 로그인 화면을 띄운다.
 const TOKEN_KEY = 'sc_token';
 
 function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
@@ -313,19 +314,16 @@ const App = {
       history.replaceState(null, '', location.pathname); // 새로고침 시 재처리되지 않게 파라미터 제거
     }
 
-    // 최초 1회만 사용 안내 가이드 표시
-    if (!localStorage.getItem('sc_onboarding_done')) {
-      this.state.showOnboarding = true;
-    }
-
-    this.requestNotifyPermission();
     this.checkPushEnabled();
     this.loadDemoHint();
 
-    // 데이터를 불러오기 전에 로그인 상태부터 복원해야 한다.
-    // 토큰이 붙지 않은 채로 /schedule을 부르면 남의(게스트) 일정이 잠깐 보였다가 바뀐다.
+    // 저장된 토큰으로 로그인 상태를 먼저 복원한다.
+    // 로그인하지 않았으면 데이터를 아예 요청하지 않는다 (요청해봐야 서버가 401을 준다).
     await this.restoreSession();
-    await this.reloadAll();
+    if (this.state.user) {
+      await this.reloadAll();
+      this.afterLoginSetup();
+    }
     this.state.loading = false;
     this.render();
     if (shareStatus) {
@@ -336,16 +334,36 @@ const App = {
     }
   },
 
+  // 로그인이 확인된 뒤에만 해야 하는 것들.
+  // 알림 권한 요청과 최초 사용 안내는 로그인 화면 위에 뜨면 안 된다.
+  afterLoginSetup() {
+    this.requestNotifyPermission();
+    if (!localStorage.getItem('sc_onboarding_done')) {
+      this.state.showOnboarding = true;
+    }
+  },
+
   async reloadAll() {
+    if (!this.state.user) return; // 로그인 전에는 서버에 물어볼 것이 없다
     try {
-      const [events, todos, briefing] = await Promise.all([
-        apiFetch(`${API_BASE}/schedule`).then(r => r.json()),
-        apiFetch(`${API_BASE}/todos`).then(r => r.json()),
-        apiFetch(`${API_BASE}/briefing`).then(r => r.json()).catch(() => null),
+      const [eventsRes, todosRes, briefingRes] = await Promise.all([
+        apiFetch(`${API_BASE}/schedule`),
+        apiFetch(`${API_BASE}/todos`),
+        apiFetch(`${API_BASE}/briefing`),
       ]);
-      this.state.events = events;
-      this.state.todos = todos;
-      this.state.briefing = briefing;
+
+      // 토큰이 만료됐거나(30일 경과) 서버의 JWT_SECRET이 바뀌면 401이 온다.
+      // 이때 응답 본문은 배열이 아니라 { error }라서, 그대로 넣으면 화면이 깨진다.
+      // 조용히 로그인 화면으로 돌려보내는 게 맞다.
+      if ([eventsRes, todosRes].some(r => r.status === 401)) {
+        this.handleSessionExpired();
+        return;
+      }
+
+      const [events, todos] = await Promise.all([eventsRes.json(), todosRes.json()]);
+      this.state.events = Array.isArray(events) ? events : [];
+      this.state.todos = Array.isArray(todos) ? todos : [];
+      this.state.briefing = briefingRes.ok ? await briefingRes.json().catch(() => null) : null;
       this.rebuildColorIndex();
     } catch (err) {
       console.error('데이터 로딩 실패', err);
@@ -739,6 +757,22 @@ App.render = function() {
   const s = this.state;
   const t = this.theme(s.dark);
   document.getElementById('page-wrap').style.background = s.dark ? '#0a0a10' : '#EDEDF2';
+
+  // 로그인하지 않았으면 앱 화면을 아예 그리지 않는다.
+  // 저장된 토큰을 확인하는 동안(loading)에는 로그인 폼 대신 스플래시를 띄운다 —
+  // 이미 로그인된 사용자에게 로그인 화면이 깜빡였다가 사라지면 로그아웃된 것처럼 보인다.
+  if (!s.user) {
+    const shellEl = document.getElementById('app-shell');
+    shellEl.innerHTML = `
+      <div style="${this.styleStr({ height:'100%', display:'flex', flexDirection:'column', position:'relative', background:t.bg, color:t.text, fontFamily:"'Jua',sans-serif" })}">
+        ${s.loading ? this.renderSplash(t) : this.renderAuth(t)}
+        ${s.toastMessage ? this.renderToast(t) : ''}
+      </div>
+    `;
+    this._lastSignature = this.renderSignature();
+    return;
+  }
+
   const html = `
     <div style="${this.styleStr({ height:'100%', display:'flex', flexDirection:'column', position:'relative', background:t.bg, color:t.text, fontFamily:"'Jua',sans-serif" })}">
       ${this.renderTopBar(t)}
@@ -755,7 +789,6 @@ App.render = function() {
       ${s.stepEditorOpen ? this.renderStepEditor(t) : ''}
       ${s.catEditorOpen ? this.renderCategoryEditor(t) : ''}
       ${s.yearMonthModalOpen ? this.renderYearMonthModal(t) : ''}
-      ${s.authScreen === 'auth' ? this.renderAuth(t) : ''}
       ${s.authScreen === 'profile' ? this.renderProfile(t) : ''}
       ${s.showOnboarding ? this.renderOnboarding(t) : ''}
       ${s.toastMessage ? this.renderToast(t) : ''}
@@ -798,31 +831,23 @@ App.renderTopBar = function(t) {
   `;
 };
 
-// 상단 바 맨 오른쪽의 로그인/로그아웃 토글.
-// 로그아웃 상태 → "로그인"(누르면 로그인 화면), 로그인 상태 → "로그아웃"(누르면 바로 로그아웃).
-// 로그인한 계정 정보를 보고 싶으면 아이콘 쪽(아바타)을 길게 볼 필요 없이 설정 탭에서 확인한다.
+// 상단 바 맨 오른쪽의 로그아웃 버튼.
+// 로그인해야만 앱 화면이 그려지므로, 이 버튼이 보이는 시점에는 항상 로그인 상태다.
+// 누르면 바로 로그아웃되고 로그인 화면으로 돌아간다.
 App.renderAuthButton = function(t) {
   const user = this.state.user;
-  const on = !!user;
-  const initial = on ? ((user.name || '').trim()[0] || 'U') : '';
+  if (!user) return '';
+  const initial = (user.name || '').trim()[0] || 'U';
   return `
     <div style="${this.styleStr({
       display:'flex', alignItems:'center', gap:5, flexShrink:0, cursor:'pointer',
-      padding: on ? '4px 9px 4px 4px' : '6px 11px',
-      borderRadius:16,
-      background: on ? t.surfaceAlt : t.primary,
-      border: on ? `1px solid ${t.border}` : 'none',
-    })}" onclick="App.${on ? 'logout' : 'openAuth'}()" title="${on ? this.esc(user.email) : '로그인'}">
-      ${on
-        ? `<div style="${this.styleStr({ width:20, height:20, borderRadius:10, background:t.primary, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, fontWeight:800 })}">${this.esc(initial)}</div>`
-        : `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3M10 11l3-3-3-3M13 8H6" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
-      <span style="${this.styleStr({ fontSize:12, fontWeight:800, color: on ? t.text : '#fff', fontFamily:"'Jua',sans-serif", whiteSpace:'nowrap' })}">${on ? '로그아웃' : '로그인'}</span>
+      padding:'4px 9px 4px 4px', borderRadius:16,
+      background:t.surfaceAlt, border:`1px solid ${t.border}`,
+    })}" onclick="App.logout()" title="${this.esc(user.email)}">
+      <div style="${this.styleStr({ width:20, height:20, borderRadius:10, background:t.primary, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, fontWeight:800 })}">${this.esc(initial)}</div>
+      <span style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.text, fontFamily:"'Jua',sans-serif", whiteSpace:'nowrap' })}">로그아웃</span>
     </div>
   `;
-};
-
-App.openAuth = function() {
-  this.setState({ authScreen: 'auth', authMode: 'login', authError: '', authPassword: '' });
 };
 
 App.renderCalendar = function(t) {
@@ -1532,9 +1557,7 @@ App.renderSettings = function(t) {
   return `
     <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">
 
-      ${card(s.user
-        ? rowBtn(this.esc(s.user.name), `${this.esc(s.user.email)}로 로그인 중이에요${s.user.isDemo ? ' · 심사용 계정' : ''}`, 'App.setState({authScreen:\'profile\'})', '계정 ›')
-        : rowBtn('로그인하지 않음', '로그인하면 일정이 계정에 저장돼서 다른 기기에서도 이어서 볼 수 있어요', 'App.openAuth()', '로그인 ›'))}
+      ${card(rowBtn(this.esc(s.user.name), `${this.esc(s.user.email)}로 로그인 중이에요${s.user.isDemo ? ' · 심사용 계정' : ''}`, 'App.setState({authScreen:\'profile\'})', '계정 ›'))}
 
       ${card(`
         ${rowBtn('일정 종류', '이름·색·기본 준비기간을 바꾸거나 새 종류를 추가해요', 'App.openCategoryEditor()', '변경 ›')}
@@ -2029,13 +2052,16 @@ App.renderAuth = function(t) {
   const s = this.state;
   const isSignup = s.authMode === 'signup';
 
+  // 로그인 화면은 "돌아갈 곳"이 없는 관문이다. 뒤로가기 버튼과 둘러보기 링크를 두지 않는다.
   return `
-    <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
-      <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authScreen:null})">
-        <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+    <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', justifyContent:'center', padding:'40px 24px', overflow:'auto' })}">
+      <div style="${this.styleStr({ display:'flex', flexDirection:'column', alignItems:'center', marginBottom:26 })}">
+        <img src="logo-mark.png" alt="" style="${this.styleStr({ width:52, height:52, objectFit:'contain', marginBottom:12 })}" />
+        <div style="${this.styleStr({ fontSize:21, fontWeight:800, color:t.text, fontFamily:"'Jua',sans-serif" })}">신박한 캘린더</div>
+        <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, marginTop:5, textAlign:'center', lineHeight:1.5 })}">마감일이 아니라<br>준비 시작일을 알려주는 AI 캘린더</div>
       </div>
-      <div style="${this.styleStr({ fontSize:23, fontWeight:800, color:t.text, marginBottom:6 })}">${isSignup?'회원가입':'로그인'}</div>
-      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, marginBottom:26 })}">${isSignup?'몇 가지 정보만 입력하면 바로 시작할 수 있어요.':'다시 만나서 반가워요.'}</div>
+      <div style="${this.styleStr({ fontSize:17, fontWeight:800, color:t.text, marginBottom:4 })}">${isSignup?'회원가입':'로그인'}</div>
+      <div style="${this.styleStr({ fontSize:12.5, color:t.textMuted, marginBottom:20 })}">${isSignup?'몇 가지 정보만 입력하면 바로 시작할 수 있어요.':'로그인하면 내 일정만 보이고, 다른 기기에서도 이어서 볼 수 있어요.'}</div>
       ${isSignup ? `
         <div style="margin-bottom:14px">
           <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이름</div>
@@ -2060,7 +2086,17 @@ App.renderAuth = function(t) {
         <div>${isSignup?'이미 계정이 있으신가요?':'계정이 없으신가요?'}</div>
         <div style="${this.styleStr({ color:t.primary, fontWeight:800, cursor:'pointer' })}" onclick="App.setState({authMode: App.state.authMode==='login'?'signup':'login', authError:''})">${isSignup?'로그인':'회원가입'}</div>
       </div>
-      <div style="${this.styleStr({ textAlign:'center', fontSize:12.5, color:t.textFaint, marginTop:18, cursor:'pointer', textDecoration:'underline' })}" onclick="App.setState({authScreen:null})">로그인 없이 둘러보기</div>
+    </div>
+  `;
+};
+
+// 저장된 토큰을 확인하는 동안 잠깐 보여주는 화면.
+// 로그인 폼을 먼저 띄웠다가 앱으로 바뀌면 이미 로그인한 사용자에게 혼란스럽다.
+App.renderSplash = function(t) {
+  return `
+    <div style="${this.styleStr({ position:'absolute', inset:0, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:14, background:t.bg })}">
+      <img src="logo-mark.png" alt="" style="${this.styleStr({ width:56, height:56, objectFit:'contain', opacity:0.9 })}" />
+      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, fontFamily:"'Jua',sans-serif" })}">불러오는 중…</div>
     </div>
   `;
 };
@@ -2178,11 +2214,13 @@ App.submitAuth = async function() {
     this.state.authPassword = '';
     // 계정이 바뀌면 보이는 데이터가 통째로 바뀌므로 전부 다시 불러온다
     await this.reloadAll();
+    this.afterLoginSetup();
     this.setState({
       authBusy: false,
       authScreen: null,
       authError: '',
       loading: false,
+      tab: 'today',
       toastMessage: data.seeded
         ? `${data.user.name}님, 심사용 샘플 일정을 오늘 날짜에 맞춰 준비했어요.`
         : `${data.user.name}님, 반가워요!`,
@@ -2193,16 +2231,26 @@ App.submitAuth = async function() {
   }
 };
 
-App.logout = async function() {
+// 로그아웃하면 로그인 화면으로 돌아간다.
+// 다음 사람이 앞사람의 일정을 보지 못하도록 화면의 데이터를 즉시 비운다.
+App.clearSession = function(patch) {
   setToken('');
   this.state.user = null;
-  // 로그아웃하면 게스트 데이터로 돌아간다 (내 일정이 남의 화면에 남아있지 않도록 즉시 비운다)
   this.state.events = [];
   this.state.todos = [];
   this.state.briefing = null;
-  await this.reloadAll();
-  this.setState({ authScreen: null, authMode: 'login', authEmail: '', authPassword: '', authName: '', authError: '', toastMessage: '로그아웃했어요.' });
+  this.state.authScreen = null;
+  this.setState({ authMode: 'login', authPassword: '', authName: '', authError: '', ...patch });
   this.autoHideToast();
+};
+
+App.logout = function() {
+  this.clearSession({ authEmail: '', toastMessage: '로그아웃했어요.' });
+};
+
+// 토큰이 만료되거나 무효해졌을 때 (30일 경과, 서버 키 변경 등)
+App.handleSessionExpired = function() {
+  this.clearSession({ toastMessage: '로그인이 만료됐어요. 다시 로그인해주세요.' });
 };
 
 App.autoHideToast = function(ms = 4000) {
