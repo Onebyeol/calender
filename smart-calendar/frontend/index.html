@@ -2215,17 +2215,15 @@ App.submitAuth = async function() {
     // 계정이 바뀌면 보이는 데이터가 통째로 바뀌므로 전부 다시 불러온다
     await this.reloadAll();
     this.afterLoginSetup();
+    // 로그인 직후에는 안내 문구를 띄우지 않는다.
+    // 화면이 앱으로 바뀌는 것 자체가 이미 로그인됐다는 신호라 한 번 더 알릴 이유가 없다.
     this.setState({
       authBusy: false,
       authScreen: null,
       authError: '',
       loading: false,
       tab: 'today',
-      toastMessage: data.seeded
-        ? `${data.user.name}님, 심사용 샘플 일정을 오늘 날짜에 맞춰 준비했어요.`
-        : `${data.user.name}님, 반가워요!`,
     });
-    this.autoHideToast();
   } catch (err) {
     this.setState({ authBusy: false, authError: '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.' });
   }
