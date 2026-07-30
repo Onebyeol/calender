@@ -15,17 +15,19 @@ function ensureConfigured() {
 }
 
 /**
- * 저장된 모든 구독자에게 푸시 알림을 보냄 (지금은 로그인/유저 구분이 없어서
- * "이 기기에서 알림 받기"를 눌렀던 모든 브라우저에게 다 감)
+ * 특정 사용자의 기기에만 푸시 알림을 보냄.
+ * userId가 null이면 로그인하지 않은 상태에서 알림을 켠 기기들이 대상이 된다
+ * (게스트끼리는 같은 묶음이라 서로 알림을 받는다 — 로그인하면 완전히 분리된다).
+ * @param {string|null} userId
  * @param {{title: string, body: string, url?: string}} payload
  */
-async function sendPushToAll(payload) {
+async function sendPushToUser(userId, payload) {
   ensureConfigured();
   if (!configured) return;
 
-  const subs = await PushSubscription.find();
+  const subs = await PushSubscription.find({ user: userId || null });
   if (subs.length === 0) {
-    console.log('[push] 등록된 구독자가 없음 (아직 아무도 "알림 받기"를 안 눌렀음)');
+    console.log('[push] 이 사용자에게 등록된 구독자가 없음 (아직 "알림 받기"를 안 눌렀음)');
     return;
   }
 
@@ -50,4 +52,4 @@ async function sendPushToAll(payload) {
   );
 }
 
-module.exports = { sendPushToAll };
+module.exports = { sendPushToUser };

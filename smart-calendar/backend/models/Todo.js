@@ -2,6 +2,13 @@ const mongoose = require('mongoose');
 
 const todoSchema = new mongoose.Schema(
   {
+    // 소유자. null이면 로그인 없이 만들어진 게스트 데이터 (Notice.js의 설명과 동일)
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+      index: true,
+    },
     noticeId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Notice',

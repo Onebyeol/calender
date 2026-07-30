@@ -5,7 +5,8 @@ const Notice = require('../models/Notice');
 const ScheduleEvent = require('../models/ScheduleEvent');
 const Todo = require('../models/Todo');
 const { analyzeTextNotice, analyzeImageNotice } = require('../services/geminiService');
-const { sendPushToAll } = require('../services/pushService');
+const { sendPushToUser } = require('../services/pushService');
+const { ownerScope } = require('../middleware/auth');
 const {
   todayIso,
   diffDays,
@@ -51,19 +52,20 @@ const upload = multer({
 });
 
 // 일정이 하나 생성될 때마다 호출: 즉시 등록 알림 1번 + (테스트용) 1분 뒤 알람 1번을 푸시로 보냄
+// 알림은 그 일정을 만든 사용자의 기기에만 간다 (event.user가 null이면 게스트 기기들).
 function notifyEventCreated(event) {
   // 준비기간이 붙은 일정은 마감일이 아니라 "언제부터 시작하면 되는지"를 알려준다 (기획서의 핵심 메시지)
   const body = event.needsPrep
     ? `"${event.title}" — ${event.startDate}부터 준비 시작하면 돼요. (마감 ${event.endDate})`
     : `"${event.title}" 일정이 캘린더에 추가됐어요.`;
 
-  sendPushToAll({
+  sendPushToUser(event.user, {
     title: event.needsPrep ? '준비 시작일을 잡았어요' : '일정이 등록됐어요',
     body,
   }).catch((err) => console.error('[push] 등록 알림 실패:', err.message));
 
   setTimeout(() => {
-    sendPushToAll({
+    sendPushToUser(event.user, {
       title: '⏰ 테스트 알람',
       body: `"${event.title}" 일정 알림이에요!`,
     }).catch((err) => console.error('[push] 테스트 알람 실패:', err.message));
@@ -204,6 +206,7 @@ router.post('/notices/confirm', async (req, res) => {
     const eventFields = addEvent ? buildEventFields(addEvent, cat, priority, ctx) : null;
 
     const notice = await Notice.create({
+      user: req.userId,
       sourceType,
       rawContent,
       summary: summary || '',
@@ -218,6 +221,7 @@ router.post('/notices/confirm', async (req, res) => {
 
     if (eventFields) {
       savedEvent = await ScheduleEvent.create({
+        user: req.userId,
         noticeId: notice._id,
         ...eventFields,
         category: cat,
@@ -233,6 +237,7 @@ router.post('/notices/confirm', async (req, res) => {
 
     if (addTodo) {
       savedTodo = await Todo.create({
+        user: req.userId,
         noticeId: notice._id,
         title: addTodo.title,
         due: addTodo.due,
@@ -252,7 +257,7 @@ router.post('/notices/confirm', async (req, res) => {
 // 전체 일정 조회 (캘린더 월 그리드 + 알림 탭 그룹핑에 사용, 클라이언트에서 월별 필터링)
 router.get('/schedule', async (req, res) => {
   try {
-    const events = await ScheduleEvent.find().sort({ startDate: 1, start: 1 });
+    const events = await ScheduleEvent.find(ownerScope(req)).sort({ startDate: 1, start: 1 });
     res.json(events);
   } catch (err) {
     console.error('[GET /schedule]', err);
@@ -279,6 +284,7 @@ router.post('/schedule', async (req, res) => {
     );
 
     const event = await ScheduleEvent.create({
+      user: req.userId,
       ...fields,
       category: cat,
       alarm: alarm !== undefined ? alarm : true,
@@ -298,7 +304,8 @@ router.post('/schedule', async (req, res) => {
 // leadTimeDays가 들어오면 원래 마감 기준으로 startDate와 단계 계획일을 다시 계산한다
 router.patch('/schedule/:id', async (req, res) => {
   try {
-    const event = await ScheduleEvent.findById(req.params.id);
+    // 남의 일정을 id만 알아내서 수정하지 못하도록 소유자 조건을 항상 함께 건다
+    const event = await ScheduleEvent.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
 
     const fields = ['title', 'startDate', 'endDate', 'start', 'end', 'alarm', 'notify', 'priority'];
@@ -348,7 +355,8 @@ router.patch('/schedule/:id', async (req, res) => {
 // Todo의 완료 토글과 같은 패턴. 인덱스로 단계 하나를 뒤집는다.
 router.patch('/schedule/:id/steps/:index', async (req, res) => {
   try {
-    const event = await ScheduleEvent.findById(req.params.id);
+    // 남의 일정을 id만 알아내서 수정하지 못하도록 소유자 조건을 항상 함께 건다
+    const event = await ScheduleEvent.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
 
     const idx = Number(req.params.index);
@@ -373,7 +381,8 @@ router.patch('/schedule/:id/steps/:index', async (req, res) => {
 // 완료 상태는 "제목이 그대로 남아있는 단계"만 유지한다(이름을 바꾸면 새 단계로 본다).
 router.put('/schedule/:id/steps', async (req, res) => {
   try {
-    const event = await ScheduleEvent.findById(req.params.id);
+    // 남의 일정을 id만 알아내서 수정하지 못하도록 소유자 조건을 항상 함께 건다
+    const event = await ScheduleEvent.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
 
     const incoming = Array.isArray(req.body.steps) ? req.body.steps : [];
@@ -413,7 +422,8 @@ router.post('/schedule/:id/retro', async (req, res) => {
       return res.status(400).json({ error: 'feeling은 tight/ok/loose 중 하나여야 함' });
     }
 
-    const event = await ScheduleEvent.findById(req.params.id);
+    // 남의 일정을 id만 알아내서 수정하지 못하도록 소유자 조건을 항상 함께 건다
+    const event = await ScheduleEvent.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
 
     // 실제 준비 시작일 = 가장 먼저 체크한 단계의 완료 시각
@@ -445,7 +455,7 @@ router.post('/schedule/:id/retro', async (req, res) => {
 // 일정 삭제
 router.delete('/schedule/:id', async (req, res) => {
   try {
-    const event = await ScheduleEvent.findByIdAndDelete(req.params.id);
+    const event = await ScheduleEvent.findOneAndDelete({ _id: req.params.id, ...ownerScope(req) });
     if (!event) return res.status(404).json({ error: '일정을 찾을 수 없음' });
     res.json({ deleted: true });
   } catch (err) {
@@ -458,7 +468,7 @@ router.delete('/schedule/:id', async (req, res) => {
 
 router.get('/todos', async (req, res) => {
   try {
-    const todos = await Todo.find().sort({ done: 1, due: 1 });
+    const todos = await Todo.find(ownerScope(req)).sort({ done: 1, due: 1 });
     res.json(todos);
   } catch (err) {
     console.error('[GET /todos]', err);
@@ -473,7 +483,7 @@ router.post('/todos', async (req, res) => {
     if (!title || !due) {
       return res.status(400).json({ error: 'title/due가 필요함' });
     }
-    const todo = await Todo.create({ title, due, done: false });
+    const todo = await Todo.create({ user: req.userId, title, due, done: false });
     res.status(201).json(todo);
   } catch (err) {
     console.error('[POST /todos]', err);
@@ -483,7 +493,7 @@ router.post('/todos', async (req, res) => {
 
 router.patch('/todos/:id', async (req, res) => {
   try {
-    const todo = await Todo.findById(req.params.id);
+    const todo = await Todo.findOne({ _id: req.params.id, ...ownerScope(req) });
     if (!todo) return res.status(404).json({ error: '할일을 찾을 수 없음' });
     todo.done = !todo.done;
     await todo.save();
@@ -532,8 +542,8 @@ router.get('/briefing', async (req, res) => {
   try {
     const today = req.query.date || todayIso();
     const [events, todos] = await Promise.all([
-      ScheduleEvent.find(),
-      Todo.find({ done: false }),
+      ScheduleEvent.find(ownerScope(req)),
+      Todo.find({ done: false, ...ownerScope(req) }),
     ]);
 
     // 오늘 신경 써야 하는 일정 = 준비 기간이나 일정 구간 안에 오늘이 들어있는 것
@@ -574,11 +584,12 @@ router.get('/briefing', async (req, res) => {
 
 // ---------- 공유/단축어 자동화: 분석 + 저장을 한 번에 ----------
 // Android Web Share Target과 iOS 단축어가 같은 저장 로직을 공유한다.
-async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx }) {
+async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx, userId }) {
   parsed.category = ctx.toKey(parsed.category);
   const shaped = shapeParsed(parsed, ctx);
 
   const notice = await Notice.create({
+    user: userId,
     sourceType,
     rawContent,
     summary: shaped.summary,
@@ -594,6 +605,7 @@ async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx }) {
   if (shaped.event) {
     // shapeParsed()에서 이미 준비기간이 반영된 상태(startDate 당겨짐 + steps 생성)라 그대로 저장
     savedEvent = await ScheduleEvent.create({
+      user: userId,
       noticeId: notice._id,
       ...shaped.event,
       category: shaped.category,
@@ -608,6 +620,7 @@ async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx }) {
   }
   if (shaped.todo) {
     savedTodo = await Todo.create({
+      user: userId,
       noticeId: notice._id,
       title: shaped.todo.title,
       due: shaped.todo.due,
@@ -629,18 +642,18 @@ async function saveQuickAddAnalysis({ parsed, rawContent, sourceType, ctx }) {
   return { message, notice, event: savedEvent, todo: savedTodo };
 }
 
-async function quickAddTextNotice(text, categories) {
+async function quickAddTextNotice(text, categories, userId = null) {
   // 공유 시트는 종류 설정을 못 보내므로 기본 6종으로 처리된다.
   const ctx = categoryContext(categories);
   const { parsed, rawContent } = await analyzeTextNotice(text.trim(), ctx.labels);
-  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'text', ctx });
+  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'text', ctx, userId });
 }
 
-async function quickAddImageNotice(file, categories) {
+async function quickAddImageNotice(file, categories, userId = null) {
   const ctx = categoryContext(categories);
   const base64Image = file.buffer.toString('base64');
   const { parsed, rawContent } = await analyzeImageNotice(base64Image, file.mimetype, ctx.labels);
-  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'image', ctx });
+  return saveQuickAddAnalysis({ parsed, rawContent, sourceType: 'image', ctx, userId });
 }
 
 // 아이폰 단축어용 JSON API
@@ -651,7 +664,7 @@ router.post('/notices/quick-add', async (req, res) => {
       return res.status(400).json({ error: '공지 텍스트가 비어있음' });
     }
 
-    const result = await quickAddTextNotice(text, req.body.categories);
+    const result = await quickAddTextNotice(text, req.body.categories, req.userId);
     res.status(201).json(result);
   } catch (err) {
     console.error('[POST /notices/quick-add]', err);
@@ -752,8 +765,8 @@ async function handleSharedNotice(req, res) {
 
   try {
     const result = req.file
-      ? await quickAddImageNotice(req.file)
-      : await quickAddTextNotice(sharedText);
+      ? await quickAddImageNotice(req.file, null, req.userId)
+      : await quickAddTextNotice(sharedText, null, req.userId);
     return sendShareOutcome(req, res, 'success', result.message);
   } catch (err) {
     console.error('[POST /notices/share-target]', err);
@@ -769,7 +782,7 @@ router.get('/notices/share-target', async (req, res) => {
     return sendShareOutcome(req, res, 'error', '공유 데이터를 받지 못했어요. 앱을 다시 설치한 뒤 시도해주세요.');
   }
   try {
-    const result = await quickAddTextNotice(sharedText);
+    const result = await quickAddTextNotice(sharedText, null, req.userId);
     return sendShareOutcome(req, res, 'success', result.message);
   } catch (err) {
     console.error('[GET /notices/share-target]', err);
@@ -798,9 +811,10 @@ router.post('/push/subscribe', async (req, res) => {
     if (!endpoint || !keys || !keys.p256dh || !keys.auth) {
       return res.status(400).json({ error: '구독 정보가 올바르지 않음' });
     }
+    // 같은 기기(endpoint)에서 다른 계정으로 로그인한 뒤 알림을 켜면 소유자만 새 계정으로 바뀐다
     await PushSubscription.findOneAndUpdate(
       { endpoint },
-      { endpoint, keys },
+      { endpoint, keys, user: req.userId },
       { upsert: true, new: true }
     );
     res.status(201).json({ ok: true });

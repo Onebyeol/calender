@@ -15,5 +15,9 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      # 로그인 토큰 서명 키. Render가 한 번 만들어 계속 유지하므로
+      # 재배포되어도 심사위원의 로그인이 풀리지 않는다.
+      - key: JWT_SECRET
+        generateValue: true
       - key: GEMINI_MODEL
         value: gemini-3.1-flash-lite,gemini-3.1-flash,gemini-2.5-flash

@@ -4,6 +4,20 @@ self.addEventListener('activate', (event) => {
   event.waitUntil(self.clients.claim());
 });
 
+// 서비스워커는 localStorage를 읽을 수 없어서, 앱이 로그인할 때 Cache에 복사해둔 토큰을 읽는다.
+// 이게 없으면 공유 시트로 등록한 공지가 로그인한 계정이 아니라 게스트 쪽에 저장돼서
+// 정작 앱에서는 보이지 않는다.
+async function readAuthToken() {
+  try {
+    const cache = await caches.open('sc-auth');
+    const hit = await cache.match('/__auth-token');
+    if (!hit) return '';
+    return (await hit.text()).trim();
+  } catch (err) {
+    return '';
+  }
+}
+
 // Android Web Share Target의 파일 POST는 서비스워커에서 먼저 formData로 읽은 뒤
 // 새 multipart 요청으로 서버에 전달한다. Android/WebAPK가 만든 원본 스트림을 서버로
 // 바로 넘길 때 일부 기기에서 "Unexpected end of form"이 나는 문제를 피하기 위함이다.
@@ -27,10 +41,12 @@ self.addEventListener('fetch', (event) => {
         }
       }
 
+      const token = await readAuthToken();
       const uploadResponse = await fetch('/api/notices/share-upload?relay=1', {
         method: 'POST',
         body: outgoing,
         credentials: 'include',
+        headers: token ? { Authorization: `Bearer ${token}` } : undefined,
       });
       const result = await uploadResponse.json();
       const query = new URLSearchParams({

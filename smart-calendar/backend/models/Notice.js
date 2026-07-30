@@ -5,6 +5,13 @@ const mongoose = require('mongoose');
 // 나중에 "이 공지에서 파생된 일정/할일" 을 역추적할 수 있게 함
 const noticeSchema = new mongoose.Schema(
   {
+    // 소유자. null이면 로그인 없이(둘러보기 / 공유 시트 / 단축어) 만들어진 게스트 데이터다.
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+      index: true,
+    },
     sourceType: {
       type: String,
       enum: ['text', 'image'],

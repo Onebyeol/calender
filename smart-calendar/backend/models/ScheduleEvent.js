@@ -17,6 +17,14 @@ const stepSchema = new mongoose.Schema(
 
 const scheduleEventSchema = new mongoose.Schema(
   {
+    // 소유자. null이면 로그인 없이(둘러보기 / 공유 시트 / 단축어) 만들어진 게스트 데이터다.
+    // 로그인한 사용자와 게스트는 서로의 일정을 볼 수 없다.
+    user: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+      index: true,
+    },
     // AI 분석에서 나온 일정이면 원본 공지를 가리킴. 수동으로 추가한 일정이면 null
     noticeId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -129,6 +137,6 @@ const scheduleEventSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-scheduleEventSchema.index({ startDate: 1, endDate: 1 });
+scheduleEventSchema.index({ user: 1, startDate: 1, endDate: 1 });
 
 module.exports = mongoose.model('ScheduleEvent', scheduleEventSchema);

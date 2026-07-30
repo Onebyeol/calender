@@ -55,6 +55,40 @@
 <script>
 const API_BASE = '/api';
 
+// ---------- 로그인 토큰 ----------
+// 로그인하면 서버가 준 JWT를 여기 저장해두고, 모든 API 요청에 Authorization 헤더로 붙인다.
+// 토큰이 없으면 헤더 없이 나가고, 서버는 그 요청을 "게스트"로 처리한다(로그인 없이 둘러보기).
+const TOKEN_KEY = 'sc_token';
+
+function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+
+function setToken(token) {
+  if (token) localStorage.setItem(TOKEN_KEY, token);
+  else localStorage.removeItem(TOKEN_KEY);
+  // 서비스워커는 localStorage를 읽을 수 없다. Android 공유 시트로 들어온 공지도
+  // 로그인한 계정에 저장되어야 하므로, 서비스워커가 읽을 수 있는 Cache에 토큰을 복사해둔다.
+  syncTokenToServiceWorker(token);
+}
+
+function syncTokenToServiceWorker(token) {
+  if (!('caches' in window)) return;
+  caches.open('sc-auth')
+    .then(cache => token
+      ? cache.put('/__auth-token', new Response(token))
+      : cache.delete('/__auth-token'))
+    .catch(() => {});
+}
+
+// fetch를 그대로 쓰되 Authorization 헤더만 얹어주는 얇은 래퍼.
+// FormData 업로드도 그대로 통과해야 하므로 Content-Type은 건드리지 않는다.
+function apiFetch(url, init = {}) {
+  const token = getToken();
+  if (!token) return fetch(url, init);
+  const headers = new Headers(init.headers || {});
+  headers.set('Authorization', `Bearer ${token}`);
+  return fetch(url, { ...init, headers });
+}
+
 const PRIORITY_META = {
   high: { label: '높음', color: '#EF6F5B' },
   medium: { label: '보통', color: '#E8A23D' },
@@ -197,11 +231,12 @@ const App = {
     todoDraftTitle: '',
 
     authScreen: null, // null | 'auth' | 'profile'
-    authMode: 'login',
+    authMode: 'login',  // 'login' | 'signup'
     authName: '', authEmail: '', authPassword: '',
-    authFindEmail: '', authFindMessage: '',
     authError: '',
-    isLoggedIn: false,
+    authBusy: false,          // 서버 응답을 기다리는 중 (버튼 중복 클릭 방지)
+    user: null,               // 로그인한 사용자 { id, name, email, isDemo }. null이면 게스트
+    demoHint: null,           // 로그인 화면에 띄울 심사용 계정 { email, password }
 
     noticeText: '',
     imageFile: null,
@@ -285,7 +320,11 @@ const App = {
 
     this.requestNotifyPermission();
     this.checkPushEnabled();
+    this.loadDemoHint();
 
+    // 데이터를 불러오기 전에 로그인 상태부터 복원해야 한다.
+    // 토큰이 붙지 않은 채로 /schedule을 부르면 남의(게스트) 일정이 잠깐 보였다가 바뀐다.
+    await this.restoreSession();
     await this.reloadAll();
     this.state.loading = false;
     this.render();
@@ -300,9 +339,9 @@ const App = {
   async reloadAll() {
     try {
       const [events, todos, briefing] = await Promise.all([
-        fetch(`${API_BASE}/schedule`).then(r => r.json()),
-        fetch(`${API_BASE}/todos`).then(r => r.json()),
-        fetch(`${API_BASE}/briefing`).then(r => r.json()).catch(() => null),
+        apiFetch(`${API_BASE}/schedule`).then(r => r.json()),
+        apiFetch(`${API_BASE}/todos`).then(r => r.json()),
+        apiFetch(`${API_BASE}/briefing`).then(r => r.json()).catch(() => null),
       ]);
       this.state.events = events;
       this.state.todos = todos;
@@ -688,7 +727,7 @@ App.buildGrid = function(mode) {
 App.renderSignature = function() {
   const s = this.state;
   return [s.tab, s.calendarMode, s.addSheetOpen, s.modalOpen, s.todoModalOpen, s.detailEventId != null,
-    s.yearMonthModalOpen, s.authScreen, s.showOnboarding,
+    s.yearMonthModalOpen, s.authScreen, s.authMode, !!s.user, s.showOnboarding,
     s.stepEditorOpen, s.stepDraft.length,
     s.catEditorOpen, s.catDraft.length, s.catExpanded].join('|');
 };
@@ -716,8 +755,8 @@ App.render = function() {
       ${s.stepEditorOpen ? this.renderStepEditor(t) : ''}
       ${s.catEditorOpen ? this.renderCategoryEditor(t) : ''}
       ${s.yearMonthModalOpen ? this.renderYearMonthModal(t) : ''}
-      <!-- 로그인/회원가입/프로필은 실제 인증 백엔드가 없는 목업이라 화면에서 뺐다.
-           눌리는데 동작하지 않는 화면은 "완결성 있게 작동하는가" 기준에서 손해다. -->
+      ${s.authScreen === 'auth' ? this.renderAuth(t) : ''}
+      ${s.authScreen === 'profile' ? this.renderProfile(t) : ''}
       ${s.showOnboarding ? this.renderOnboarding(t) : ''}
       ${s.toastMessage ? this.renderToast(t) : ''}
     </div>
@@ -745,15 +784,43 @@ App.renderTopBar = function(t) {
   // 본문과 배경색이 같으면 경계가 안 보여서, 상단 바는 surface + 아래 경계선으로 띄운다.
   // 다크모드 토글은 설정 탭에 있으므로 여기서는 뺐다(같은 기능이 두 곳에 있을 이유가 없다).
   return `
-    <div style="${this.styleStr({ display:'flex', alignItems:'center', paddingTop:'calc(10px + env(safe-area-inset-top))', paddingLeft:16, paddingRight:16, paddingBottom:10, flexShrink:0, background:t.surface, borderBottom:`1px solid ${t.border}` })}">
+    <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:8, paddingTop:'calc(10px + env(safe-area-inset-top))', paddingLeft:16, paddingRight:16, paddingBottom:10, flexShrink:0, background:t.surface, borderBottom:`1px solid ${t.border}` })}">
       ${isSubScreen
-        ? `<div style="${this.styleStr({ width:32, height:32, marginRight:2, borderRadius:16, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer', flexShrink:0 })}" onclick="App.closeNotice()">
+        ? `<div style="${this.styleStr({ width:32, height:32, borderRadius:16, display:'flex', alignItems:'center', justifyContent:'center', background:t.surfaceAlt, cursor:'pointer', flexShrink:0 })}" onclick="App.closeNotice()">
              <svg width="14" height="14" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.text}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
            </div>`
-        : `<img src="logo-mark.png" alt="신박한 캘린더" style="${this.styleStr({ width:26, height:26, objectFit:'contain', flexShrink:0, marginRight:8 })}" />`}
-      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, letterSpacing:'-0.2px', fontFamily:"'Jua',sans-serif" })}">${title}</div>
+        : this.renderAuthButton(t)}
+      <img src="logo-mark.png" alt="신박한 캘린더" style="${this.styleStr({ width:24, height:24, objectFit:'contain', flexShrink:0 })}" />
+      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, letterSpacing:'-0.2px', fontFamily:"'Jua',sans-serif", whiteSpace:'nowrap' })}">${title}</div>
     </div>
   `;
+};
+
+// 상단 바 맨 왼쪽의 로그인/로그아웃 토글.
+// 로그아웃 상태 → "로그인"(누르면 로그인 화면), 로그인 상태 → "로그아웃"(누르면 바로 로그아웃).
+// 로그인한 계정 정보를 보고 싶으면 아이콘 쪽(아바타)을 길게 볼 필요 없이 설정 탭에서 확인한다.
+App.renderAuthButton = function(t) {
+  const user = this.state.user;
+  const on = !!user;
+  const initial = on ? ((user.name || '').trim()[0] || 'U') : '';
+  return `
+    <div style="${this.styleStr({
+      display:'flex', alignItems:'center', gap:5, flexShrink:0, cursor:'pointer',
+      padding: on ? '4px 9px 4px 4px' : '6px 11px',
+      borderRadius:16,
+      background: on ? t.surfaceAlt : t.primary,
+      border: on ? `1px solid ${t.border}` : 'none',
+    })}" onclick="App.${on ? 'logout' : 'openAuth'}()" title="${on ? this.esc(user.email) : '로그인'}">
+      ${on
+        ? `<div style="${this.styleStr({ width:20, height:20, borderRadius:10, background:t.primary, color:'#fff', display:'flex', alignItems:'center', justifyContent:'center', fontSize:11, fontWeight:800 })}">${this.esc(initial)}</div>`
+        : `<svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M6 2H3a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h3M10 11l3-3-3-3M13 8H6" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/></svg>`}
+      <span style="${this.styleStr({ fontSize:12, fontWeight:800, color: on ? t.text : '#fff', fontFamily:"'Jua',sans-serif", whiteSpace:'nowrap' })}">${on ? '로그아웃' : '로그인'}</span>
+    </div>
+  `;
+};
+
+App.openAuth = function() {
+  this.setState({ authScreen: 'auth', authMode: 'login', authError: '', authPassword: '' });
 };
 
 App.renderCalendar = function(t) {
@@ -1463,6 +1530,10 @@ App.renderSettings = function(t) {
   return `
     <div style="${this.styleStr({ flex:1, overflow:'auto', padding:'4px 16px 40px' })}">
 
+      ${card(s.user
+        ? rowBtn(this.esc(s.user.name), `${this.esc(s.user.email)}로 로그인 중이에요${s.user.isDemo ? ' · 심사용 계정' : ''}`, 'App.setState({authScreen:\'profile\'})', '계정 ›')
+        : rowBtn('로그인하지 않음', '로그인하면 일정이 계정에 저장돼서 다른 기기에서도 이어서 볼 수 있어요', 'App.openAuth()', '로그인 ›'))}
+
       ${card(`
         ${rowBtn('일정 종류', '이름·색·기본 준비기간을 바꾸거나 새 종류를 추가해요', 'App.openCategoryEditor()', '변경 ›')}
         <div style="${this.styleStr({ marginTop:13, paddingTop:13, borderTop:`1px solid ${t.border}` })}">${this.renderLegend(t)}</div>
@@ -1955,27 +2026,6 @@ App.renderStepEditor = function(t) {
 App.renderAuth = function(t) {
   const s = this.state;
   const isSignup = s.authMode === 'signup';
-  const isFind = s.authMode === 'find-id' || s.authMode === 'find-pw';
-
-  if (isFind) {
-    const isFindId = s.authMode === 'find-id';
-    return `
-      <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
-        <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authMode:'login'})">
-          <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        </div>
-        <div style="${this.styleStr({ fontSize:23, fontWeight:800, color:t.text, marginBottom:6 })}">${isFindId?'아이디 찾기':'비밀번호 찾기'}</div>
-        <div style="${this.styleStr({ fontSize:13, color:t.textMuted, marginBottom:26 })}">가입할 때 사용한 이메일을 입력하면 ${isFindId?'아이디를':'재설정 링크를'} 보내드려요.</div>
-        <div style="margin-bottom:14px">
-          <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이메일</div>
-          <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authFindEmail)}" oninput="App.state.authFindEmail=this.value" placeholder="you@example.com">
-        </div>
-        <div style="${this.styleStr({ padding:15, borderRadius:14, background:t.primary, color:'#fff', fontWeight:800, fontSize:15, textAlign:'center', cursor:'pointer', marginTop:6 })}" onclick="App.submitFindAccount()">${isFindId?'아이디 찾기':'재설정 메일 보내기'}</div>
-        ${s.authFindMessage ? `<div style="${this.styleStr({ marginTop:16, padding:12, borderRadius:10, background:t.surfaceAlt, color:t.text, fontSize:13, lineHeight:1.5 })}">${this.esc(s.authFindMessage)}</div>` : ''}
-        <div style="${this.styleStr({ textAlign:'center', fontSize:12.5, color:t.primary, marginTop:20, cursor:'pointer', fontWeight:700 })}" onclick="App.setState({authMode:'login'})">로그인으로 돌아가기</div>
-      </div>
-    `;
-  }
 
   return `
     <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
@@ -1990,25 +2040,23 @@ App.renderAuth = function(t) {
           <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authName)}" oninput="App.state.authName=this.value" placeholder="이름">
         </div>` : ''}
       <div style="margin-bottom:14px">
-        <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">${isSignup?'이메일':'아이디'}</div>
-        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="text" value="${this.esc(s.authEmail)}" oninput="App.state.authEmail=this.value" placeholder="${isSignup?'you@example.com':'admin'}">
+        <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">이메일</div>
+        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="email" autocomplete="username" value="${this.esc(s.authEmail)}" oninput="App.state.authEmail=this.value" onkeydown="if(event.key==='Enter')App.submitAuth()" placeholder="you@example.com">
       </div>
       <div style="margin-bottom:14px">
         <div style="${this.styleStr({ fontSize:12, fontWeight:700, color:t.textMuted, marginBottom:6 })}">비밀번호</div>
-        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="password" value="${this.esc(s.authPassword)}" oninput="App.state.authPassword=this.value" placeholder="••••••••">
+        <input style="${this.styleStr({ width:'100%', padding:'10px 12px', borderRadius:10, border:`1px solid ${t.border}`, background:t.surfaceAlt, color:t.text, fontSize:14 })}" type="password" autocomplete="${isSignup?'new-password':'current-password'}" value="${this.esc(s.authPassword)}" oninput="App.state.authPassword=this.value" onkeydown="if(event.key==='Enter')App.submitAuth()" placeholder="${isSignup?'6자 이상':'••••••••'}">
       </div>
-      ${!isSignup ? `
-        <div style="${this.styleStr({ background:t.surfaceAlt, border:`1px dashed ${t.border}`, borderRadius:10, padding:'8px 10px', marginBottom:14, fontSize:12, color:t.textMuted, textAlign:'center' })}">🔑 데모 계정 &nbsp;<b style="${this.styleStr({color:t.text})}">admin / admin1234</b></div>
-        <div style="${this.styleStr({ display:'flex', justifyContent:'flex-end', gap:12, marginBottom:6, fontSize:12, color:t.textMuted })}">
-          <div style="${this.styleStr({ cursor:'pointer' })}" onclick="App.setState({authMode:'find-id', authFindMessage:''})">아이디 찾기</div>
-          <div style="${this.styleStr({ color:t.border })}">|</div>
-          <div style="${this.styleStr({ cursor:'pointer' })}" onclick="App.setState({authMode:'find-pw', authFindMessage:''})">비밀번호 찾기</div>
+      ${!isSignup && s.demoHint ? `
+        <div style="${this.styleStr({ background:t.surfaceAlt, border:`1px dashed ${t.border}`, borderRadius:10, padding:'10px 12px', marginBottom:14, fontSize:12, color:t.textMuted, textAlign:'center', cursor:'pointer' })}" onclick="App.fillDemoAccount()">
+          🔑 심사용 계정 &nbsp;<b style="${this.styleStr({color:t.text})}">${this.esc(s.demoHint.email)} / ${this.esc(s.demoHint.password)}</b>
+          <div style="${this.styleStr({ marginTop:4, fontSize:11, color:t.textFaint })}">여기를 누르면 자동으로 입력돼요 · 샘플 일정이 함께 들어있어요</div>
         </div>` : ''}
       ${s.authError ? `<div style="${this.styleStr({ color:'#EF6F5B', fontSize:12.5, marginBottom:10, textAlign:'center' })}">${this.esc(s.authError)}</div>` : ''}
-      <div style="${this.styleStr({ padding:15, borderRadius:14, background:t.primary, color:'#fff', fontWeight:800, fontSize:15, textAlign:'center', cursor:'pointer', marginTop:6 })}" onclick="App.attemptLogin()">${isSignup?'회원가입':'로그인'}</div>
+      <div style="${this.styleStr({ padding:15, borderRadius:14, background:s.authBusy?t.border:t.primary, color:'#fff', fontWeight:800, fontSize:15, textAlign:'center', cursor:s.authBusy?'default':'pointer', marginTop:6 })}" onclick="App.submitAuth()">${s.authBusy ? '잠시만요…' : (isSignup?'회원가입':'로그인')}</div>
       <div style="${this.styleStr({ display:'flex', justifyContent:'center', gap:5, marginTop:20, fontSize:13, color:t.textMuted })}">
         <div>${isSignup?'이미 계정이 있으신가요?':'계정이 없으신가요?'}</div>
-        <div style="${this.styleStr({ color:t.primary, fontWeight:800, cursor:'pointer' })}" onclick="App.setState({authMode: App.state.authMode==='login'?'signup':'login'})">${isSignup?'로그인':'회원가입'}</div>
+        <div style="${this.styleStr({ color:t.primary, fontWeight:800, cursor:'pointer' })}" onclick="App.setState({authMode: App.state.authMode==='login'?'signup':'login', authError:''})">${isSignup?'로그인':'회원가입'}</div>
       </div>
       <div style="${this.styleStr({ textAlign:'center', fontSize:12.5, color:t.textFaint, marginTop:18, cursor:'pointer', textDecoration:'underline' })}" onclick="App.setState({authScreen:null})">로그인 없이 둘러보기</div>
     </div>
@@ -2017,20 +2065,29 @@ App.renderAuth = function(t) {
 
 App.renderProfile = function(t) {
   const s = this.state;
-  const initial = (s.authName.trim()[0]) || 'U';
+  const user = s.user;
+  if (!user) return '';
+  const initial = (user.name || '').trim()[0] || 'U';
   return `
     <div style="${this.styleStr({ position:'absolute', inset:0, background:t.bg, zIndex:60, display:'flex', flexDirection:'column', padding:'56px 24px 24px', overflow:'auto' })}">
       <div style="${this.styleStr({ width:32, height:32, borderRadius:16, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', marginBottom:22 })}" onclick="App.setState({authScreen:null})">
         <svg width="9" height="15" viewBox="0 0 9 15"><path d="M8 1L1 7.5 8 14" stroke="${t.textMuted}" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
       </div>
       <div style="${this.styleStr({ width:64, height:64, borderRadius:32, background:t.primary, display:'flex', alignItems:'center', justifyContent:'center', color:'#fff', fontSize:24, fontWeight:800, margin:'0 auto 14px' })}">${this.esc(initial)}</div>
-      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, textAlign:'center' })}">${this.esc(s.authName.trim() || '사용자')}</div>
-      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, textAlign:'center', marginBottom:26 })}">${this.esc(s.authEmail.trim() || 'guest@example.com')}</div>
+      <div style="${this.styleStr({ fontSize:18, fontWeight:800, color:t.text, textAlign:'center' })}">${this.esc(user.name)}</div>
+      <div style="${this.styleStr({ fontSize:13, color:t.textMuted, textAlign:'center', marginBottom:8 })}">${this.esc(user.email)}</div>
+      ${user.isDemo ? `<div style="${this.styleStr({ fontSize:11.5, color:t.textFaint, textAlign:'center', marginBottom:22, lineHeight:1.5 })}">심사용 계정이에요. 로그인할 때마다 오늘 날짜에 맞춘<br>샘플 일정이 자동으로 채워집니다.</div>` : `<div style="${this.styleStr({ marginBottom:22 })}"></div>`}
       <div style="${this.styleStr({ display:'flex', flexDirection:'column', gap:2 })}">
-        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">계정 정보</div>
-        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">공지 연동 설정</div>
-        <div style="${this.styleStr({ padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14.5, fontWeight:600, color:t.text, cursor:'pointer' })}">알림 설정</div>
-        <div style="${this.styleStr({ padding:'14px 4px', fontSize:14.5, fontWeight:700, color:'#EF6F5B', textAlign:'center', marginTop:18, cursor:'pointer' })}" onclick="App.setState({isLoggedIn:false, authScreen:null})">로그아웃</div>
+        <div style="${this.styleStr({ display:'flex', justifyContent:'space-between', padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14, color:t.text })}">
+          <span style="${this.styleStr({ fontWeight:600 })}">내 일정</span><span style="${this.styleStr({ color:t.textMuted })}">${s.events.length}개</span>
+        </div>
+        <div style="${this.styleStr({ display:'flex', justifyContent:'space-between', padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14, color:t.text })}">
+          <span style="${this.styleStr({ fontWeight:600 })}">할일</span><span style="${this.styleStr({ color:t.textMuted })}">${s.todos.filter(td=>!td.done).length}개 남음</span>
+        </div>
+        <div style="${this.styleStr({ display:'flex', justifyContent:'space-between', padding:'14px 4px', borderBottom:`1px solid ${t.border}`, fontSize:14, color:t.text })}">
+          <span style="${this.styleStr({ fontWeight:600 })}">이 기기 알림</span><span style="${this.styleStr({ color:s.pushEnabled?t.primary:t.textMuted })}">${s.pushEnabled?'켜짐':'꺼짐'}</span>
+        </div>
+        <div style="${this.styleStr({ padding:'14px 4px', fontSize:14.5, fontWeight:700, color:'#EF6F5B', textAlign:'center', marginTop:18, cursor:'pointer' })}" onclick="App.logout()">로그아웃</div>
       </div>
     </div>
   `;
@@ -2051,32 +2108,104 @@ App.onStartDateChange = function(value) {
 
 App.toggleDark = function() { this.setState(s => ({ dark: !s.dark })); };
 
-// 데모/심사용 계정 검증 (실제 회원 DB는 아직 없어서, 고정 계정 하나만 허용)
-const DEMO_ACCOUNT = { id: 'admin', password: 'admin1234' };
-App.attemptLogin = function() {
-  const s = this.state;
-  if (s.authMode === 'signup') {
-    // 회원가입은 아직 실제 계정 시스템이 없어서 그대로 로그인 처리 (데모용)
-    this.setState({ isLoggedIn:true, authScreen:null, authError:'' });
-    return;
-  }
-  const email = s.authEmail.trim();
-  const pw = s.authPassword;
-  if (email === DEMO_ACCOUNT.id && pw === DEMO_ACCOUNT.password) {
-    this.setState({ isLoggedIn:true, authScreen:null, authError:'', authName: s.authName || '관리자' });
-  } else {
-    this.setState({ authError: '아이디 또는 비밀번호가 올바르지 않아요. (데모 계정: admin / admin1234)' });
+// ---------- 로그인 / 회원가입 ----------
+// 화면(state)만 바꾸던 예전 목업과 달리, 실제로 서버에 계정을 만들고 JWT를 받아온다.
+// 로그인하면 그 계정이 소유한 일정만 보이고, 다른 계정/게스트의 일정은 보이지 않는다.
+
+// 심사용 계정 안내를 서버에서 받아 로그인 화면에 띄운다.
+// (.env의 DEMO_EMAIL/DEMO_PASSWORD를 바꿔도 화면 안내가 저절로 따라오게 하기 위함)
+App.loadDemoHint = async function() {
+  try {
+    const hint = await apiFetch(`${API_BASE}/auth/demo-account`).then(r => r.ok ? r.json() : null);
+    if (hint && hint.email) this.setState({ demoHint: hint });
+  } catch (err) { /* 안내 문구일 뿐이라 실패해도 무시 */ }
+};
+
+App.fillDemoAccount = function() {
+  const hint = this.state.demoHint;
+  if (!hint) return;
+  this.setState({ authEmail: hint.email, authPassword: hint.password, authError: '' });
+};
+
+// 저장된 토큰이 아직 유효한지 확인하고 사용자 정보를 복원한다 (앱을 다시 열었을 때)
+App.restoreSession = async function() {
+  if (!getToken()) return;
+  try {
+    const res = await apiFetch(`${API_BASE}/auth/me`);
+    if (res.ok) {
+      const { user } = await res.json();
+      this.state.user = user;
+      // 서비스워커 쪽 토큰이 비어있을 수 있으니(캐시 삭제 등) 다시 맞춰준다
+      syncTokenToServiceWorker(getToken());
+    } else {
+      setToken(''); // 만료됐거나 서버에서 계정이 사라짐 → 게스트로 돌아간다
+    }
+  } catch (err) {
+    // 네트워크 오류일 뿐일 수 있으므로 토큰은 지우지 않는다
+    console.warn('세션 복원 실패', err);
   }
 };
-App.submitFindAccount = function() {
-  const email = this.state.authFindEmail.trim();
-  if (!email) return;
-  const isFindId = this.state.authMode === 'find-id';
-  // 실제 계정 시스템이 아직 없어서(로그인은 화면만 있는 상태) 안내 메시지만 보여줌
-  const msg = isFindId
-    ? `${email}로 가입된 아이디 정보를 보내드렸어요. 메일함을 확인해주세요.`
-    : `${email}로 비밀번호 재설정 링크를 보내드렸어요. 메일함을 확인해주세요.`;
-  this.setState({ authFindMessage: msg });
+
+App.submitAuth = async function() {
+  const s = this.state;
+  if (s.authBusy) return;
+
+  const isSignup = s.authMode === 'signup';
+  const name = s.authName.trim();
+  const email = s.authEmail.trim();
+  const password = s.authPassword;
+
+  if (isSignup && !name) return this.setState({ authError: '이름을 입력해주세요.' });
+  if (!email || !password) return this.setState({ authError: '이메일과 비밀번호를 입력해주세요.' });
+
+  this.setState({ authBusy: true, authError: '' });
+  try {
+    const res = await apiFetch(`${API_BASE}/auth/${isSignup ? 'signup' : 'login'}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(isSignup ? { name, email, password } : { email, password }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      this.setState({ authBusy: false, authError: data.error || '로그인에 실패했어요.' });
+      return;
+    }
+
+    setToken(data.token);
+    this.state.user = data.user;
+    this.state.authPassword = '';
+    // 계정이 바뀌면 보이는 데이터가 통째로 바뀌므로 전부 다시 불러온다
+    await this.reloadAll();
+    this.setState({
+      authBusy: false,
+      authScreen: null,
+      authError: '',
+      loading: false,
+      toastMessage: data.seeded
+        ? `${data.user.name}님, 심사용 샘플 일정을 오늘 날짜에 맞춰 준비했어요.`
+        : `${data.user.name}님, 반가워요!`,
+    });
+    this.autoHideToast();
+  } catch (err) {
+    this.setState({ authBusy: false, authError: '서버에 연결하지 못했어요. 잠시 후 다시 시도해주세요.' });
+  }
+};
+
+App.logout = async function() {
+  setToken('');
+  this.state.user = null;
+  // 로그아웃하면 게스트 데이터로 돌아간다 (내 일정이 남의 화면에 남아있지 않도록 즉시 비운다)
+  this.state.events = [];
+  this.state.todos = [];
+  this.state.briefing = null;
+  await this.reloadAll();
+  this.setState({ authScreen: null, authMode: 'login', authEmail: '', authPassword: '', authName: '', authError: '', toastMessage: '로그아웃했어요.' });
+  this.autoHideToast();
+};
+
+App.autoHideToast = function(ms = 4000) {
+  clearTimeout(this._toastTimer);
+  this._toastTimer = setTimeout(() => this.setState({ toastMessage: null }), ms);
 };
 App.renderYearMonthModal = function(t) {
   const s = this.state;
@@ -2130,7 +2259,7 @@ App.saveManualTodo = async function() {
   const title = this.state.todoDraftTitle.trim();
   if (!title) return;
   try {
-    await fetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.selectedDate }) });
+    await apiFetch(`${API_BASE}/todos`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ title, due: this.state.selectedDate }) });
     await this.reloadAll();
     this.setState({ todoModalOpen:false, todoDraftTitle:'', tab:'calendar', calendarMode:'todo' });
   } catch (err) {
@@ -2145,9 +2274,9 @@ App.saveEvent = async function() {
   const payload = { title:f.title, startDate:f.startDate, endDate, start:f.start, end:f.end, alarm:f.alarm, notify:f.notify, priority:f.priority };
   try {
     if (this.state.modalMode === 'edit') {
-      await fetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     } else {
-      await fetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      await apiFetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     }
     await this.reloadAll();
     this.setState({ modalOpen:false, selectedDate: f.startDate, tab:'calendar', calendarMode:'event' });
@@ -2162,7 +2291,7 @@ App.saveEvent = async function() {
 App.deleteEvent = async function() {
   const f = this.state.form;
   try {
-    await fetch(`${API_BASE}/schedule/${f.id}`, { method:'DELETE' });
+    await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'DELETE' });
     await this.reloadAll();
     this.setState({ modalOpen:false });
   } catch (err) {
@@ -2171,7 +2300,7 @@ App.deleteEvent = async function() {
 };
 
 App.toggleTodo = async function(id) {
-  await fetch(`${API_BASE}/todos/${id}`, { method:'PATCH' });
+  await apiFetch(`${API_BASE}/todos/${id}`, { method:'PATCH' });
   await this.reloadAll();
   this.render();
 };
@@ -2292,7 +2421,7 @@ App.resetCategoryDraft = function() {
 // 단계 하나를 완료/미완료로 토글. Todo 완료 토글과 같은 패턴.
 App.toggleStep = async function(eventId, index) {
   try {
-    const res = await fetch(`${API_BASE}/schedule/${eventId}/steps/${index}`, { method:'PATCH' });
+    const res = await apiFetch(`${API_BASE}/schedule/${eventId}/steps/${index}`, { method:'PATCH' });
     if (!res.ok) throw new Error((await res.json()).error || '단계 업데이트 실패');
     await this.reloadAll();
     this.render();
@@ -2345,7 +2474,7 @@ App.saveStepDraft = async function() {
   }
 
   try {
-    const res = await fetch(`${API_BASE}/schedule/${ev._id}/steps`, {
+    const res = await apiFetch(`${API_BASE}/schedule/${ev._id}/steps`, {
       method:'PUT', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ steps }),
     });
@@ -2376,7 +2505,7 @@ App.changeEventLead = async function(eventId, delta) {
   const next = Math.min(30, Math.max(1, (ev.leadTimeDays || 0) + delta));
   if (next === ev.leadTimeDays) return;
   try {
-    const res = await fetch(`${API_BASE}/schedule/${eventId}`, {
+    const res = await apiFetch(`${API_BASE}/schedule/${eventId}`, {
       method:'PATCH', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ leadTimeDays: next, categories: this.categories() }),
     });
@@ -2390,7 +2519,7 @@ App.changeEventLead = async function(eventId, delta) {
 App.saveRetro = async function(eventId, feeling) {
   const ev = this.state.events.find(e => e._id === eventId);
   try {
-    const res = await fetch(`${API_BASE}/schedule/${eventId}/retro`, {
+    const res = await apiFetch(`${API_BASE}/schedule/${eventId}/retro`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ feeling }),
     });
@@ -2460,9 +2589,9 @@ App.analyze = async function() {
       formData.append('image', this.state.imageFile);
       // multipart라 JSON 문자열로 실어 보낸다
       formData.append('categories', JSON.stringify(this.categories()));
-      res = await fetch(`${API_BASE}/notices/analyze-image`, { method:'POST', body: formData });
+      res = await apiFetch(`${API_BASE}/notices/analyze-image`, { method:'POST', body: formData });
     } else {
-      res = await fetch(`${API_BASE}/notices/analyze-text`, { method:'POST', headers:{'Content-Type':'application/json'},
+      res = await apiFetch(`${API_BASE}/notices/analyze-text`, { method:'POST', headers:{'Content-Type':'application/json'},
         body: JSON.stringify({ text: this.state.noticeText.trim(), categories: this.categories() }) });
     }
     if (!res.ok) throw new Error((await res.json()).error || '분석 실패');
@@ -2510,7 +2639,7 @@ App.addParsedEvent = async function() {
     ? (this.state.leadDraft !== null ? this.state.leadDraft : r.leadTimeDays)
     : 0;
   try {
-    await fetch(`${API_BASE}/notices/confirm`, {
+    await apiFetch(`${API_BASE}/notices/confirm`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({
         sourceType:p.sourceType, rawContent:p.rawContent,
@@ -2540,7 +2669,7 @@ App.addParsedTodo = async function() {
   const p = this.state.parsedResult;
   if (!p || !p.result.todo || this.state.addedTodo) return;
   try {
-    await fetch(`${API_BASE}/notices/confirm`, {
+    await apiFetch(`${API_BASE}/notices/confirm`, {
       method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({ sourceType:p.sourceType, rawContent:p.rawContent, summary:p.result.summary, priority:p.result.priority, category:p.result.category, addTodo:p.result.todo, categories: this.categories() }),
     });
@@ -2679,7 +2808,7 @@ App.enablePushNotifications = async function() {
     const reg = await navigator.serviceWorker.register('/service-worker.js');
     await navigator.serviceWorker.ready;
 
-    const { publicKey } = await fetch(`${API_BASE}/push/vapid-public-key`).then(r => r.json());
+    const { publicKey } = await apiFetch(`${API_BASE}/push/vapid-public-key`).then(r => r.json());
     if (!publicKey) {
       this.showToast('서버에 VAPID 키가 설정 안 돼있어요.');
       return;
@@ -2693,7 +2822,7 @@ App.enablePushNotifications = async function() {
       });
     }
 
-    await fetch(`${API_BASE}/push/subscribe`, {
+    await apiFetch(`${API_BASE}/push/subscribe`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(sub.toJSON()),
