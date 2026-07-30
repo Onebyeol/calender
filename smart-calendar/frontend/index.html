@@ -960,7 +960,11 @@ App.renderCalendar = function(t) {
       </div>
     </div>
     <div style="${this.styleStr({ display:'flex', justifyContent:'center', flexShrink:0, borderBottom:`1px solid ${t.border}`, padding:'0 0 4px' })}">${weekdayHtml}</div>
-    <div style="${this.styleStr({ flexShrink:0, display:'flex', justifyContent:'center', maxHeight:'52%', overflow:'auto' })}">
+    <!-- 달 넘기기: 위 화살표 버튼 말고도 그리드를 좌우로 스와이프하거나(모바일)
+         트랙패드로 가로 스크롤해서(데스크톱) 넘길 수 있다.
+         touchAction:'pan-y'를 줘서 세로 스크롤은 브라우저에 맡기고 가로 제스처만 가져온다. -->
+    <div style="${this.styleStr({ flexShrink:0, display:'flex', justifyContent:'center', maxHeight:'52%', overflow:'auto', touchAction:'pan-y' })}"
+         ontouchstart="App.onGridTouchStart(event)" ontouchend="App.onGridTouchEnd(event)" onwheel="App.onGridWheel(event)">
       <div style="${this.styleStr({ width:GRID_W, display:'flex', flexDirection:'column', justifyContent:'flex-start', gap:ROW_GAP, padding:'6px 0 8px', position:'relative', backgroundImage:verticalLines })}">${weeksHtml}</div>
     </div>
     ${isTodoMode ? this.renderDayTasks(t) : this.renderDayDetail(t)}
@@ -2289,6 +2293,44 @@ App.confirmYearMonthPicker = function() {
 
 App.prevMonth = function() { this.setState(s => { let m=s.viewMonth-1,y=s.viewYear; if(m<0){m=11;y--;} return {viewMonth:m, viewYear:y}; }); };
 App.nextMonth = function() { this.setState(s => { let m=s.viewMonth+1,y=s.viewYear; if(m>11){m=0;y++;} return {viewMonth:m, viewYear:y}; }); };
+
+// ---------- 캘린더 좌우 스와이프로 달 넘기기 ----------
+// 상태가 바뀔 때마다 innerHTML을 통째로 다시 그리기 때문에 addEventListener는 매번 날아간다.
+// 그래서 이 앱의 다른 곳과 동일하게 인라인 핸들러(ontouchstart 등)로 연결한다.
+
+App.SWIPE_MIN_X = 45; // 이보다 짧게 움직이면 탭이나 손떨림으로 본다
+
+App.onGridTouchStart = function(e) {
+  const touch = e.changedTouches && e.changedTouches[0];
+  this._swipeFrom = touch ? { x: touch.clientX, y: touch.clientY } : null;
+};
+
+App.onGridTouchEnd = function(e) {
+  const from = this._swipeFrom;
+  const touch = e.changedTouches && e.changedTouches[0];
+  this._swipeFrom = null;
+  if (!from || !touch) return;
+
+  const dx = touch.clientX - from.x;
+  const dy = touch.clientY - from.y;
+  // 세로로 더 많이 움직였으면 그리드를 스크롤하려던 것이므로 달을 넘기지 않는다
+  if (Math.abs(dx) < this.SWIPE_MIN_X || Math.abs(dx) <= Math.abs(dy)) return;
+
+  if (dx < 0) this.nextMonth(); // 왼쪽으로 밀면 다음 달
+  else this.prevMonth();
+};
+
+// 데스크톱/트랙패드의 가로 스크롤. 한 번 밀어도 wheel 이벤트가 연속으로 오기 때문에
+// 시간 간격을 둬서 한 번의 제스처가 여러 달을 건너뛰지 않게 한다.
+App.onGridWheel = function(e) {
+  if (Math.abs(e.deltaX) <= Math.abs(e.deltaY) || Math.abs(e.deltaX) < 20) return;
+  const now = Date.now();
+  if (now - (this._wheelAt || 0) < 400) return;
+  this._wheelAt = now;
+  e.preventDefault(); // 브라우저의 "뒤로 가기" 제스처로 넘어가지 않게 막는다
+  if (e.deltaX > 0) this.nextMonth();
+  else this.prevMonth();
+};
 
 App.openAddModal = function() {
   this.setState({ modalOpen:true, modalMode:'add', form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', notify:true, priority:'medium' } });
