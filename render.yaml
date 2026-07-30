@@ -7,7 +7,9 @@ services:
     buildCommand: cd backend && npm ci
     startCommand: cd backend && npm start
     healthCheckPath: /health
-    autoDeployTrigger: off
+    # 따옴표 필수: YAML 1.1 파서는 따옴표 없는 off를 불리언 false로 읽어버린다.
+    # (이 필드는 "off" | "commit" | "checksPass" 문자열만 받는다)
+    autoDeployTrigger: "off"
     envVars:
       - key: NODE_ENV
         value: production
