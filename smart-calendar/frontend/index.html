@@ -128,6 +128,13 @@ const STEP_TEMPLATE_OPTIONS = [
   { value:'school',       label:'학사형', preview:'안내문 확인 → 준비물 → 최종확인' },
   { value:'generic',      label:'일반',   preview:'내용 확인 → 준비 → 마무리' },
 ];
+const STEP_TEMPLATE_DEFAULTS = {
+  presentation: ['자료조사', '초안 작성', '리허설', '최종 점검'],
+  writing: ['자료조사', '개요 잡기', '본문 작성', '퇴고·제출'],
+  exam: ['시험 범위 정리', '1차 복습', '오답노트', '최종 점검'],
+  school: ['안내문 확인', '준비물 챙기기', '최종 확인'],
+  generic: ['내용 확인', '준비하기', '마무리'],
+};
 
 // ---------- 색상 생성 ----------
 // 색조 하나가 정해지면 그 종류의 6가지 변주를 계산해서 만든다. 표를 손으로 적어두지 않는 이유는
@@ -220,7 +227,8 @@ const App = {
 
     modalOpen: false,
     modalMode: 'add',
-    form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', notify: true, priority: 'medium' },
+    form: { id: null, title: '', startDate: todayIso(), endDate: todayIso(), start: '09:00', end: '10:00', notify: true, priority: 'medium', leadTimeDays:0, category:'' },
+    modalReturnTab: null,
     detailEventId: null,
     showDetailSource: false,
     detailSourceImageUrl: null,
@@ -267,6 +275,8 @@ const App = {
     stepEditorOpen: false,
     stepEditorEventId: null,
     stepDraft: [],          // [{ title, done }]
+    stepLeadDraft: 3,
+    stepEditorTemplateKey: '',
     stepRemember: true,     // 고친 구성을 다음에도 쓸지
     // 분석 결과에 "예전에 고쳐둔 단계 구성"이 적용됐는지 (확인 화면에 배지로 표시)
     stepPrefApplied: false,
@@ -1088,6 +1098,15 @@ App.renderTaskRow = function(t, item, opts) {
         ${item.sub ? `<div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, marginTop:3, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(item.sub)}</div>` : ''}
       </div>
       ${o.late ? `<div style="${this.styleStr({ fontSize:10.5, fontWeight:800, color:'#EF6F5B', flexShrink:0 })}">${o.lateLabel}</div>` : ''}
+      ${item.kind === 'step' ? `
+        <button type="button" aria-label="일정 수정" title="일정 수정·삭제" onclick="event.stopPropagation(); App.openEditModal('${item.eventId}')" style="${this.styleStr({
+          width:30, height:30, borderRadius:9, border:`1px solid ${t.border}`, background:t.surfaceAlt,
+          color:t.textMuted, display:'flex', alignItems:'center', justifyContent:'center',
+          padding:0, cursor:'pointer', flexShrink:0,
+        })}">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 20h4L19 9a2.5 2.5 0 00-3.5-3.5L4 16.5V20z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        </button>
+      ` : ''}
     </div>`;
 };
 
@@ -1115,6 +1134,15 @@ App.renderEventCard = function(t, ev, opts) {
       <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:9 })}">
         <div style="${this.styleStr({ flex:1, minWidth:0, fontSize: o.compact ? 13.5 : 14.5, fontWeight:700, color:t.text, overflow:'hidden', whiteSpace:'nowrap', textOverflow:'ellipsis' })}">${this.esc(ev.title)}</div>
         ${o.right || ''}
+        ${o.quickEdit ? `
+          <button type="button" aria-label="일정 수정" title="수정·삭제" onclick="event.stopPropagation(); App.openEditModal('${ev._id}')" style="${this.styleStr({
+            width:30, height:30, borderRadius:9, border:`1px solid ${t.border}`, background:t.surfaceAlt,
+            color:t.textMuted, display:'flex', alignItems:'center', justifyContent:'center',
+            padding:0, cursor:'pointer', flexShrink:0,
+          })}">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none"><path d="M4 20h4L19 9a2.5 2.5 0 00-3.5-3.5L4 16.5V20z" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+          </button>
+        ` : ''}
       </div>
 
       ${o.compact ? '' : `
@@ -1196,8 +1224,9 @@ App.renderToday = function(t) {
     ${sectionTitle('마감이 코앞이에요')}
     ${urgent.map(ev => this.renderEventCard(t, ev, {
       right: `<div style="${this.styleStr({ fontSize:12, fontWeight:800, color:'#EF6F5B', flexShrink:0 })}">${ev.daysLeft === 0 ? '오늘 마감' : '내일 마감'}</div>`,
-      sub: `${Math.round((ev.progress || 0) * 100)}% 진행 · 준비 ${ev.leadTimeDays}일`,
+      sub: ev.needsPrep ? `${Math.round((ev.progress || 0) * 100)}% 진행 · 준비 ${ev.leadTimeDays}일` : '준비 단계 없음',
       urgent: true,
+      quickEdit: true,
     })).join('')}` : '';
 
   // ----- 곧 시작 (자리를 적게 차지하도록 한 줄씩) -----
@@ -1207,6 +1236,7 @@ App.renderToday = function(t) {
     ${upcoming.map(ev => this.renderEventCard(t, ev, {
       right: `<div style="${this.styleStr({ fontSize:11.5, fontWeight:700, color:t.textMuted, flexShrink:0 })}">${ev.startsIn === 0 ? '오늘부터' : `${ev.startsIn}일 뒤`}</div>`,
       compact: true,
+      quickEdit: true,
     })).join('')}` : '';
 
   const nothing = !tasks.length && !overdue.length && !urgent.length && !upcoming.length;
@@ -1850,6 +1880,15 @@ App.renderDetailModal = function(t) {
         <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted, margin:'14px 0 6px' })}">AI 요약</div>
         <div style="${this.styleStr({ fontSize:13.5, lineHeight:1.5, color:t.text })}">${this.esc(ev.aiSummary || '직접 추가한 일정이에요.')}</div>
         ${prepBlock}
+        ${!ev.needsPrep ? `
+          <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, marginTop:14, padding:'12px 13px', border:`1.5px dashed ${t.border}`, borderRadius:12, background:t.surfaceAlt })}">
+            <div style="${this.styleStr({ minWidth:0 })}">
+              <div style="${this.styleStr({ fontSize:12.5, fontWeight:800, color:t.text })}">준비가 필요한 일정인가요?</div>
+              <div style="${this.styleStr({ fontSize:11, color:t.textMuted, marginTop:3, lineHeight:1.45 })}">AI 판단과 관계없이 직접 준비기간과 단계를 만들 수 있어요.</div>
+            </div>
+            <button type="button" onclick="App.openStepEditor('${ev._id}')" style="${this.styleStr({ border:0, borderRadius:9, padding:'8px 10px', background:t.primary, color:'#fff', fontSize:11.5, fontWeight:800, cursor:'pointer', flexShrink:0 })}">＋ 단계 추가</button>
+          </div>
+        ` : ''}
         ${(ev.sourceContent || (ev.sourceType === 'image' && ev.noticeId)) ? `
           <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', margin:'14px 0 6px', cursor:'pointer' })}" onclick="App.toggleDetailSource()">
             <div style="${this.styleStr({ fontSize:12, fontWeight:800, color:t.textMuted })}">원본 자료</div>
@@ -1998,7 +2037,8 @@ App.renderStepEditor = function(t) {
   const ev = s.events.find(e => e._id === s.stepEditorEventId);
   if (!ev) return '';
 
-  const templateLabel = this.STEP_TEMPLATE_LABELS[ev.stepTemplateKey] || '';
+  const templateKey = s.stepEditorTemplateKey || ev.stepTemplateKey || 'generic';
+  const templateLabel = this.STEP_TEMPLATE_LABELS[templateKey] || '일반';
   const iconBtn = (disabled) => this.styleStr({
     width:26, height:26, borderRadius:8, background: disabled ? 'transparent' : t.surfaceAlt,
     border:`1px solid ${disabled ? 'transparent' : t.border}`, display:'flex', alignItems:'center', justifyContent:'center',
@@ -2031,7 +2071,21 @@ App.renderStepEditor = function(t) {
           <div style="${this.styleStr({ width:28, height:28, borderRadius:14, background:t.surfaceAlt, display:'flex', alignItems:'center', justifyContent:'center', cursor:'pointer', fontSize:13, color:t.textMuted })}" onclick="App.closeStepEditor()">✕</div>
         </div>
         <div style="${this.styleStr({ fontSize:11.5, color:t.textMuted, lineHeight:1.5, marginBottom:14 })}">
-          이름을 바꾸거나 순서를 옮길 수 있어요. 저장하면 남은 기간에 맞춰 날짜가 다시 나뉘어요.
+          ${ev.needsPrep
+            ? '이름을 바꾸거나 순서를 옮길 수 있어요. 저장하면 준비기간에 맞춰 날짜가 다시 나뉘어요.'
+            : 'AI가 준비 불필요로 판단한 일정에도 직접 준비기간과 단계를 추가할 수 있어요.'}
+        </div>
+
+        <div style="${this.styleStr({ display:'flex', alignItems:'center', justifyContent:'space-between', gap:12, padding:'11px 12px', marginBottom:14, background:t.surfaceAlt, borderRadius:11 })}">
+          <div>
+            <div style="${this.styleStr({ fontSize:12.5, fontWeight:800, color:t.text })}">준비기간</div>
+            <div style="${this.styleStr({ fontSize:10.5, color:t.textMuted, marginTop:3 })}">일정 시작일 전부터 준비해요</div>
+          </div>
+          <div style="${this.styleStr({ display:'flex', alignItems:'center', gap:8 })}">
+            <button type="button" onclick="App.changeStepLeadDraft(-1)" style="${this.styleStr({ width:28, height:28, borderRadius:9, border:`1px solid ${t.border}`, background:t.surface, color:t.text, fontSize:16, fontWeight:800, cursor:s.stepLeadDraft <= 1 ? 'default' : 'pointer', opacity:s.stepLeadDraft <= 1 ? 0.4 : 1 })}">−</button>
+            <div style="${this.styleStr({ minWidth:42, textAlign:'center', fontSize:13.5, fontWeight:800, color:t.text })}">${s.stepLeadDraft}일</div>
+            <button type="button" onclick="App.changeStepLeadDraft(1)" style="${this.styleStr({ width:28, height:28, borderRadius:9, border:`1px solid ${t.border}`, background:t.surface, color:t.text, fontSize:16, fontWeight:800, cursor:s.stepLeadDraft >= 30 ? 'default' : 'pointer', opacity:s.stepLeadDraft >= 30 ? 0.4 : 1 })}">＋</button>
+          </div>
         </div>
 
         ${rows}
@@ -2040,7 +2094,7 @@ App.renderStepEditor = function(t) {
           <div style="${this.styleStr({ padding:'9px 0', borderRadius:10, border:`1.5px dashed ${t.border}`, textAlign:'center', fontSize:12.5, fontWeight:700, color:t.textMuted, cursor:'pointer', marginTop:2 })}" onclick="App.addStepDraft()">＋ 단계 추가</div>
         ` : `<div style="${this.styleStr({ fontSize:11, color:t.textFaint, textAlign:'center', padding:'6px 0' })}">단계는 최대 8개까지예요</div>`}
 
-        ${ev.stepTemplateKey ? `
+        ${templateKey ? `
           <div style="${this.styleStr({ display:'flex', alignItems:'flex-start', gap:9, marginTop:16, padding:'11px 12px', background:t.surfaceAlt, borderRadius:11, cursor:'pointer' })}" onclick="App.setState({stepRemember: !App.state.stepRemember})">
             <div style="${check(s.stepRemember)}">
               ${s.stepRemember ? `<svg width="11" height="11" viewBox="0 0 24 24" fill="none"><path d="M4 12l6 6L20 6" stroke="#fff" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/></svg>` : ''}
@@ -2057,8 +2111,8 @@ App.renderStepEditor = function(t) {
           <div style="${this.styleStr({ flex:1, padding:13, borderRadius:12, background:t.primary, color:'#fff', fontWeight:700, fontSize:15, textAlign:'center', cursor:'pointer' })}" onclick="App.saveStepDraft()">저장</div>
         </div>
 
-        ${(ev.stepTemplateKey && this.getStepPref(ev.stepTemplateKey)) ? `
-          <div style="${this.styleStr({ textAlign:'center', fontSize:11.5, fontWeight:700, color:t.textMuted, marginTop:14, cursor:'pointer' })}" onclick="App.forgetStepPref('${ev.stepTemplateKey}')">기억해둔 ${templateLabel} 구성 지우기</div>
+        ${(templateKey && this.getStepPref(templateKey)) ? `
+          <div style="${this.styleStr({ textAlign:'center', fontSize:11.5, fontWeight:700, color:t.textMuted, marginTop:14, cursor:'pointer' })}" onclick="App.forgetStepPref('${templateKey}')">기억해둔 ${templateLabel} 구성 지우기</div>
         ` : ''}
       </div>
     </div>
@@ -2347,14 +2401,35 @@ App.onGridWheel = function(e) {
 };
 
 App.openAddModal = function() {
-  this.setState({ modalOpen:true, modalMode:'add', form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', notify:true, priority:'medium' } });
+  this.setState({
+    modalOpen:true,
+    modalMode:'add',
+    modalReturnTab:null,
+    form:{ id:null, title:'', startDate:this.state.selectedDate, endDate:this.state.selectedDate, start:'09:00', end:'10:00', notify:true, priority:'medium', leadTimeDays:0, category:'' },
+  });
 };
 App.openEditModal = function(id) {
   const ev = this.state.events.find(e => e._id === id);
   if (!ev) return;
-  this.setState({ modalOpen:true, modalMode:'edit', form:{ id: ev._id, title: ev.title, startDate: ev.startDate, endDate: ev.endDate, start: ev.start, end: ev.end, notify: ev.notify !== false, priority: ev.priority } });
+  this.setState({
+    modalOpen:true,
+    modalMode:'edit',
+    modalReturnTab:this.state.tab,
+    form:{
+      id:ev._id,
+      title:ev.title,
+      startDate:ev.originalStartDate || ev.startDate,
+      endDate:ev.endDate,
+      start:ev.start,
+      end:ev.end,
+      notify:ev.notify !== false,
+      priority:ev.priority,
+      leadTimeDays:ev.needsPrep ? ev.leadTimeDays : 0,
+      category:ev.category || '',
+    },
+  });
 };
-App.closeModal = function() { this.setState({ modalOpen:false }); };
+App.closeModal = function() { this.setState({ modalOpen:false, modalReturnTab:null }); };
 
 App.openTodoModal = function() { this.setState({ todoModalOpen:true, todoDraftTitle:'' }); };
 App.closeTodoModal = function() { this.setState({ todoModalOpen:false }); };
@@ -2373,17 +2448,32 @@ App.saveManualTodo = async function() {
 App.saveEvent = async function() {
   const f = this.state.form;
   if (!f.title.trim()) return;
+  const wasEdit = this.state.modalMode === 'edit';
+  const returnTab = this.state.modalReturnTab || this.state.tab;
   const endDate = f.endDate < f.startDate ? f.startDate : f.endDate;
   const payload = { title:f.title, startDate:f.startDate, endDate, start:f.start, end:f.end, notify:f.notify, priority:f.priority };
+  if (wasEdit && f.leadTimeDays > 0) {
+    payload.leadTimeDays = f.leadTimeDays;
+    payload.category = f.category;
+    payload.categories = this.categories();
+  }
   try {
-    if (this.state.modalMode === 'edit') {
-      await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+    let res;
+    if (wasEdit) {
+      res = await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     } else {
-      await apiFetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
+      res = await apiFetch(`${API_BASE}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload) });
     }
+    if (!res.ok) throw new Error((await res.json()).error || '일정 저장 실패');
     await this.reloadAll();
-    this.setState({ modalOpen:false, selectedDate: f.startDate, tab:'calendar', calendarMode:'event' });
-    if (this.state.modalMode !== 'edit') {
+    this.setState({
+      modalOpen:false,
+      selectedDate:f.startDate,
+      tab:wasEdit ? returnTab : 'calendar',
+      calendarMode:wasEdit ? this.state.calendarMode : 'event',
+      modalReturnTab:null,
+    });
+    if (!wasEdit) {
       this.showToast(`"${f.title}" 일정이 등록됐어요!`);
       // 알림을 꺼둔 일정이면 화면 안 테스트 알람도 띄우지 않는다 (서버 푸시도 같은 값을 본다)
       if (f.notify) this.scheduleTestAlarm({ title: f.title });
@@ -2394,10 +2484,13 @@ App.saveEvent = async function() {
 };
 App.deleteEvent = async function() {
   const f = this.state.form;
+  if (!window.confirm(`"${f.title}" 일정을 삭제할까요?`)) return;
   try {
-    await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'DELETE' });
+    const res = await apiFetch(`${API_BASE}/schedule/${f.id}`, { method:'DELETE' });
+    if (!res.ok) throw new Error((await res.json()).error || '일정 삭제 실패');
     await this.reloadAll();
-    this.setState({ modalOpen:false });
+    this.setState({ modalOpen:false, modalReturnTab:null });
+    this.showToast('일정을 삭제했어요.');
   } catch (err) {
     alert('일정 삭제 실패: ' + err.message);
   }
@@ -2536,16 +2629,35 @@ App.toggleStep = async function(eventId, index) {
 App.openStepEditor = function(eventId) {
   const ev = this.state.events.find(e => e._id === eventId);
   if (!ev) return;
+  const category = this.categoryOf(ev.category);
+  const templateKey = ev.stepTemplateKey
+    || (/발표|프레젠테이션|피피티|ppt|피티|스피치/i.test(ev.title || '')
+      ? 'presentation'
+      : (category.stepTemplate || 'generic'));
+  const remembered = this.getStepPref(templateKey);
+  const defaultSteps = remembered || STEP_TEMPLATE_DEFAULTS[templateKey] || STEP_TEMPLATE_DEFAULTS.generic;
+  const leadDays = ev.needsPrep
+    ? ev.leadTimeDays
+    : (this.getLeadPref(ev.category) || Number(category.leadDays) || 3);
+
   this.setState({
     stepEditorOpen: true,
     stepEditorEventId: eventId,
     // 원본을 직접 건드리지 않도록 복사본을 만들어서 편집한다 (취소하면 그냥 버려짐)
-    stepDraft: (ev.steps || []).map(st => ({ title: st.title, done: st.done })),
+    stepDraft: (ev.steps || []).length
+      ? ev.steps.map(st => ({ title: st.title, done: st.done }))
+      : defaultSteps.map(title => ({ title, done:false })),
+    stepLeadDraft: Math.min(30, Math.max(1, Number(leadDays) || 3)),
+    stepEditorTemplateKey: templateKey,
     stepRemember: true,
   });
 };
 App.closeStepEditor = function() {
-  this.setState({ stepEditorOpen:false, stepEditorEventId:null, stepDraft:[] });
+  this.setState({ stepEditorOpen:false, stepEditorEventId:null, stepDraft:[], stepEditorTemplateKey:'' });
+};
+App.changeStepLeadDraft = function(delta) {
+  const next = Math.min(30, Math.max(1, this.state.stepLeadDraft + delta));
+  if (next !== this.state.stepLeadDraft) this.setState({ stepLeadDraft:next });
 };
 App.addStepDraft = function() {
   if (this.state.stepDraft.length >= 8) return;
@@ -2580,20 +2692,27 @@ App.saveStepDraft = async function() {
   try {
     const res = await apiFetch(`${API_BASE}/schedule/${ev._id}/steps`, {
       method:'PUT', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({ steps }),
+      body: JSON.stringify({
+        steps,
+        leadTimeDays:s.stepLeadDraft,
+        categories:this.categories(),
+      }),
     });
     if (!res.ok) throw new Error((await res.json()).error || '단계 저장 실패');
 
     // 체크돼 있으면 이 구성을 기억해뒀다가 다음 같은 종류의 일정에 먼저 제안한다
-    if (s.stepRemember && ev.stepTemplateKey) {
-      this.setStepPref(ev.stepTemplateKey, steps.map(st => st.title));
+    if (s.stepRemember && s.stepEditorTemplateKey) {
+      this.setStepPref(s.stepEditorTemplateKey, steps.map(st => st.title));
     }
+    this.setLeadPref(ev.category, s.stepLeadDraft);
 
     await this.reloadAll();
     this.closeStepEditor();
-    this.showToast(s.stepRemember && ev.stepTemplateKey
-      ? `단계를 바꿨어요. 다음 ${this.STEP_TEMPLATE_LABELS[ev.stepTemplateKey] || ''} 일정에도 적용할게요!`
-      : '준비 단계를 바꿨어요!');
+    this.showToast(!ev.needsPrep
+      ? '이 일정에 준비 단계와 준비기간을 추가했어요!'
+      : (s.stepRemember && s.stepEditorTemplateKey
+        ? `단계를 바꿨어요. 다음 ${this.STEP_TEMPLATE_LABELS[s.stepEditorTemplateKey] || ''} 일정에도 적용할게요!`
+        : '준비 단계를 바꿨어요!'));
   } catch (err) { alert('단계 저장 실패: ' + err.message); }
 };
 App.forgetStepPref = function(templateKey) {

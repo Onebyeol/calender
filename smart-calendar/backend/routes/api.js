@@ -446,7 +446,42 @@ router.put('/schedule/:id/steps', async (req, res) => {
     }
 
     const prevByTitle = new Map(event.steps.map((s) => [s.title, s]));
-    const rebuilt = distributeSteps(cleaned.map((s) => s.title), event.startDate, event.endDate);
+    const requestedLead = Number(req.body.leadTimeDays);
+    const hasRequestedLead = Number.isFinite(requestedLead) && requestedLead > 0;
+
+    if (!event.needsPrep && !hasRequestedLead) {
+      return res.status(400).json({ error: '준비 단계를 처음 추가할 때는 준비기간이 필요함' });
+    }
+
+    let rebuilt;
+    if (hasRequestedLead && (!event.needsPrep || Math.round(requestedLead) !== event.leadTimeDays)) {
+      const ctx = categoryContext(req.body.categories);
+      const cat = event.category || FALLBACK_KEY;
+      const lead = resolveUserLeadTime({ category: cat, leadTimeDays: requestedLead, rules: ctx.rules });
+      const anchor = event.originalStartDate || event.startDate;
+      const recalced = applyLeadTime(
+        {
+          title: event.title,
+          startDate: anchor,
+          endDate: event.endDate,
+          originalStartDate: anchor,
+        },
+        lead,
+        cat,
+        { stepTitles: cleaned.map((s) => s.title), categories: ctx.list }
+      );
+
+      event.startDate = recalced.startDate;
+      event.originalStartDate = recalced.originalStartDate;
+      event.needsPrep = recalced.needsPrep;
+      event.leadTimeDays = recalced.leadTimeDays;
+      event.leadTimeSource = recalced.leadTimeSource;
+      event.stepTemplateKey = recalced.stepTemplateKey;
+      rebuilt = recalced.steps;
+    } else {
+      rebuilt = distributeSteps(cleaned.map((s) => s.title), event.startDate, event.endDate);
+    }
+
     rebuilt.forEach((step, i) => {
       if (!cleaned[i].done) return;
       step.done = true;
